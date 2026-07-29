@@ -1909,9 +1909,77 @@ HTML_GALLERY = """<!DOCTYPE html>
         @media print {
             body { display: none !important; }
         }
+
+        /* DRM Hidden Screen Overlay with Eyeball Icon & Grace Click */
+        .drm-hidden-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.96);
+            backdrop-filter: blur(24px);
+            -webkit-backdrop-filter: blur(24px);
+            z-index: 99999;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: #94a3b8;
+            user-select: none;
+            -webkit-user-select: none;
+            cursor: pointer;
+        }
+        .drm-hidden-overlay.active {
+            display: flex;
+        }
+        .drm-eye-icon {
+            font-size: 4rem;
+            margin-bottom: 0.6rem;
+            opacity: 0.85;
+            filter: drop-shadow(0 4px 12px rgba(0,0,0,0.5));
+            animation: drmPulse 2s infinite ease-in-out;
+        }
+        .drm-hidden-text {
+            font-size: 1.25rem;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: #64748b;
+        }
+        .drm-tap-notice {
+            font-size: 0.75rem;
+            color: #475569;
+            margin-top: 0.8rem;
+            font-weight: 600;
+        }
+        @keyframes drmPulse {
+            0%, 100% { transform: scale(1); opacity: 0.85; }
+            50% { transform: scale(1.05); opacity: 1; }
+        }
+
+        /* Subtle Watermark Layer when DRM is active */
+        .no-save .v-media-container::after {
+            content: "🔒 CryptHaven Protected Media";
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+            font-weight: 900;
+            color: rgba(255, 255, 255, 0.08);
+            pointer-events: none;
+            z-index: 10;
+            letter-spacing: 0.1em;
+            transform: rotate(-25deg);
+            text-transform: uppercase;
+        }
     </style>
 </head>
 <body>
+    <div id="drm-hidden-overlay" class="drm-hidden-overlay" onmousedown="handleGraceClick(event)" onclick="handleGraceClick(event)" ontouchstart="handleGraceClick(event)">
+        <div class="drm-eye-icon">👁️</div>
+        <div class="drm-hidden-text">Hidden</div>
+        <div class="drm-tap-notice">Tap anywhere to resume viewing</div>
+    </div>
     <header>
         <div class="top-row">
             <div class="title-group">
@@ -2188,22 +2256,45 @@ HTML_GALLERY = """<!DOCTYPE html>
             }
         }
 
-        function blurMediaOnCapture() {
+        let graceClickCooldown = 0;
+
+        function showDrmHiddenScreen() {
             if (allowDownloads) return;
+            const overlay = document.getElementById('drm-hidden-overlay');
+            if (overlay) overlay.classList.add('active');
+
             const gridEl = document.getElementById('grid');
             const vBody = document.getElementById('v-body');
             if (gridEl) gridEl.style.filter = 'blur(60px) opacity(0)';
             if (vBody) vBody.style.filter = 'blur(60px) opacity(0)';
-            setTimeout(() => {
-                restoreMediaAfterCapture();
-            }, 1500);
         }
 
-        function restoreMediaAfterCapture() {
+        function hideDrmHiddenScreen() {
+            const overlay = document.getElementById('drm-hidden-overlay');
+            if (overlay) overlay.classList.remove('active');
+
             const gridEl = document.getElementById('grid');
             const vBody = document.getElementById('v-body');
             if (gridEl) gridEl.style.filter = 'none';
             if (vBody && scale <= 1.05) vBody.style.filter = 'none';
+        }
+
+        function handleGraceClick(e) {
+            if (e) {
+                if (e.preventDefault) e.preventDefault();
+                if (e.stopPropagation) e.stopPropagation();
+            }
+            graceClickCooldown = Date.now() + 450;
+            hideDrmHiddenScreen();
+            return false;
+        }
+
+        function blurMediaOnCapture() {
+            if (allowDownloads) return;
+            showDrmHiddenScreen();
+            setTimeout(() => {
+                hideDrmHiddenScreen();
+            }, 1500);
         }
 
         // Anti-Save & Anti-Screenshot Event Interceptors for Grid & Lightbox
@@ -2247,27 +2338,31 @@ HTML_GALLERY = """<!DOCTYPE html>
         document.addEventListener('visibilitychange', () => {
             if (!allowDownloads) {
                 if (document.visibilityState === 'hidden') {
-                    blurMediaOnCapture();
+                    showDrmHiddenScreen();
                 } else {
-                    restoreMediaAfterCapture();
+                    graceClickCooldown = Date.now() + 450;
+                    hideDrmHiddenScreen();
                 }
             }
         });
 
         window.addEventListener('pagehide', () => {
-            if (!allowDownloads) blurMediaOnCapture();
+            if (!allowDownloads) showDrmHiddenScreen();
         });
 
         window.addEventListener('blur', () => {
-            if (!allowDownloads) blurMediaOnCapture();
+            if (!allowDownloads) showDrmHiddenScreen();
         });
 
         window.addEventListener('focus', () => {
-            if (!allowDownloads) restoreMediaAfterCapture();
+            if (!allowDownloads) {
+                graceClickCooldown = Date.now() + 450;
+                hideDrmHiddenScreen();
+            }
         });
 
         document.addEventListener('touchcancel', () => {
-            if (!allowDownloads) blurMediaOnCapture();
+            if (!allowDownloads) showDrmHiddenScreen();
         });
 
         async function init() {
