@@ -59,6 +59,53 @@ def detect_local_ip():
 
 LOCAL_IP = detect_local_ip()
 
+APP_MUTEX = None
+SINGLE_INSTANCE_SOCKET = None
+
+
+def show_already_running_popup():
+    """Display a Tkinter popup notification when another instance is already active."""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        if os.path.exists("app_icon.ico"):
+            try:
+                root.iconbitmap("app_icon.ico")
+            except Exception:
+                pass
+        messagebox.showwarning(
+            "CryptHaven Already Running",
+            "CryptHaven is already running!\n\nPlease check your system tray (near the clock) for the blue lock icon 🔒 to access the web gallery or manage settings.",
+            parent=root
+        )
+        root.destroy()
+    except Exception as e:
+        print(f"CryptHaven is already running! (Notice: {e})")
+
+
+def ensure_single_instance():
+    """Ensure only one instance of CryptHaven is running at a time."""
+    global APP_MUTEX, SINGLE_INSTANCE_SOCKET
+    if sys.platform == 'win32':
+        import ctypes
+        mutex_name = "Local\\CryptHaven_SingleInstance_Mutex_98a7b3c2"
+        APP_MUTEX = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
+        last_error = ctypes.windll.kernel32.GetLastError()
+        ERROR_ALREADY_EXISTS = 183
+
+        if last_error == ERROR_ALREADY_EXISTS:
+            show_already_running_popup()
+            sys.exit(0)
+    else:
+        import socket
+        try:
+            SINGLE_INSTANCE_SOCKET = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            SINGLE_INSTANCE_SOCKET.bind(('127.0.0.1', 59483))
+        except Exception:
+            show_already_running_popup()
+            sys.exit(0)
+
 # ── Vault Path Management & Dynamic Resolution ──────────────────────────────
 VAULT_FOLDER = ""
 DATA_DIR = ""
@@ -3502,6 +3549,7 @@ def run_vault_cycle(selected_vault_dir=None):
 
 
 if __name__ == '__main__':
+    ensure_single_instance()
     parser = argparse.ArgumentParser(description="CryptHaven — Encrypted Media Vault Server")
     parser.add_argument("--vault-dir", type=str, help="Path to vault folder (bypasses launcher UI)")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode without GUI launcher")
