@@ -1954,24 +1954,6 @@ HTML_GALLERY = """<!DOCTYPE html>
             0%, 100% { transform: scale(1); opacity: 0.85; }
             50% { transform: scale(1.05); opacity: 1; }
         }
-
-        /* Subtle Watermark Layer when DRM is active */
-        .no-save .v-media-container::after {
-            content: "🔒 CryptHaven Protected Media";
-            position: absolute;
-            inset: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 1.2rem;
-            font-weight: 900;
-            color: rgba(255, 255, 255, 0.08);
-            pointer-events: none;
-            z-index: 10;
-            letter-spacing: 0.1em;
-            transform: rotate(-25deg);
-            text-transform: uppercase;
-        }
     </style>
 </head>
 <body>
@@ -2262,11 +2244,6 @@ HTML_GALLERY = """<!DOCTYPE html>
             if (allowDownloads) return;
             const overlay = document.getElementById('drm-hidden-overlay');
             if (overlay) overlay.classList.add('active');
-
-            const gridEl = document.getElementById('grid');
-            const vBody = document.getElementById('v-body');
-            if (gridEl) gridEl.style.filter = 'blur(60px) opacity(0)';
-            if (vBody) vBody.style.filter = 'blur(60px) opacity(0)';
         }
 
         function hideDrmHiddenScreen() {
@@ -2275,8 +2252,14 @@ HTML_GALLERY = """<!DOCTYPE html>
 
             const gridEl = document.getElementById('grid');
             const vBody = document.getElementById('v-body');
-            if (gridEl) gridEl.style.filter = 'none';
-            if (vBody && scale <= 1.05) vBody.style.filter = 'none';
+            if (gridEl) {
+                gridEl.style.filter = 'none';
+                gridEl.style.opacity = '1';
+            }
+            if (vBody) {
+                vBody.style.filter = 'none';
+                vBody.style.opacity = '1';
+            }
         }
 
         function handleGraceClick(e) {
@@ -2287,14 +2270,6 @@ HTML_GALLERY = """<!DOCTYPE html>
             graceClickCooldown = Date.now() + 450;
             hideDrmHiddenScreen();
             return false;
-        }
-
-        function blurMediaOnCapture() {
-            if (allowDownloads) return;
-            showDrmHiddenScreen();
-            setTimeout(() => {
-                hideDrmHiddenScreen();
-            }, 1500);
         }
 
         // Anti-Save & Anti-Screenshot Event Interceptors for Grid & Lightbox
@@ -2319,7 +2294,8 @@ HTML_GALLERY = """<!DOCTYPE html>
                     (e.ctrlKey && (e.key === 'p' || e.key === 's')) ||
                     (e.metaKey && (e.key === 'p' || e.key === 's'))) {
                     e.preventDefault();
-                    blurMediaOnCapture();
+                    showDrmHiddenScreen();
+                    setTimeout(() => { hideDrmHiddenScreen(); }, 1500);
                     return false;
                 }
             }
@@ -2330,26 +2306,12 @@ HTML_GALLERY = """<!DOCTYPE html>
                 if (navigator.clipboard && navigator.clipboard.writeText) {
                     navigator.clipboard.writeText('');
                 }
-                blurMediaOnCapture();
+                showDrmHiddenScreen();
+                setTimeout(() => { hideDrmHiddenScreen(); }, 1500);
             }
         });
 
-        // Mobile App-Switcher & Screenshot Blur Interception (Visibility, Pagehide, Blur, TouchCancel Events)
-        document.addEventListener('visibilitychange', () => {
-            if (!allowDownloads) {
-                if (document.visibilityState === 'hidden') {
-                    showDrmHiddenScreen();
-                } else {
-                    graceClickCooldown = Date.now() + 450;
-                    hideDrmHiddenScreen();
-                }
-            }
-        });
-
-        window.addEventListener('pagehide', () => {
-            if (!allowDownloads) showDrmHiddenScreen();
-        });
-
+        // Window Focus/Blur for Desktop Hidden Screen Overlay
         window.addEventListener('blur', () => {
             if (!allowDownloads) showDrmHiddenScreen();
         });
@@ -2359,10 +2321,6 @@ HTML_GALLERY = """<!DOCTYPE html>
                 graceClickCooldown = Date.now() + 450;
                 hideDrmHiddenScreen();
             }
-        });
-
-        document.addEventListener('touchcancel', () => {
-            if (!allowDownloads) showDrmHiddenScreen();
         });
 
         async function init() {
