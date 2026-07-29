@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+vault/data/
+vault/vault_salt.bin
+vault/vault_index.json
+vault/vault_cert.pem
+vault/vault_key.pem
+vault/Exported_Decrypted_Media/
+*.exe
+build/
+dist/
+*.spec
+.env
+*.log
