@@ -64,24 +64,28 @@ SINGLE_INSTANCE_SOCKET = None
 
 
 def show_already_running_popup():
-    """Display a Tkinter popup notification when another instance is already active."""
-    try:
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        if os.path.exists("app_icon.ico"):
-            try:
-                root.iconbitmap("app_icon.ico")
-            except Exception:
-                pass
-        messagebox.showwarning(
-            "CryptHaven Already Running",
-            "CryptHaven is already running!\n\nPlease check your system tray (near the clock) for the blue lock icon 🔒 to access the web gallery or manage settings.",
-            parent=root
-        )
-        root.destroy()
-    except Exception as e:
-        print(f"CryptHaven is already running! (Notice: {e})")
+    """Display a popup notification when another instance is already active."""
+    msg = (
+        "CryptHaven is already running!\n\n"
+        "Please check your system tray (near the clock) for the blue lock icon 🔒 to access the web gallery or manage settings."
+    )
+    title = "CryptHaven Already Running"
+
+    if sys.platform == 'win32':
+        import ctypes
+        # MB_OK (0x0) | MB_ICONWARNING (0x30) | MB_SYSTEMMODAL (0x1000)
+        ctypes.windll.user32.MessageBoxW(0, msg, title, 0x30 | 0x1000)
+    else:
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes('-topmost', True)
+            messagebox.showwarning(title, msg, parent=root)
+            root.destroy()
+        except Exception as e:
+            print(f"CryptHaven is already running! (Notice: {e})")
 
 
 def ensure_single_instance():
