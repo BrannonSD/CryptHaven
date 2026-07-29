@@ -12,6 +12,8 @@ CryptHaven is a fully self-hosted, secure media server that keeps your photos an
 
 ## ✨ Features
 
+- **🗃️ Multi-Vault Launcher UI**: Select, open, or transform any folder into a media vault from a single executable launcher.
+- **🔄 On-the-fly Vault Switching**: Switch between different media vaults directly from the system tray menu without restarting the program.
 - **🔒 Zero-Knowledge Encryption**: All media is encrypted at rest using AES-256 Fernet.
 - **📱 Mobile-First Web UI**: A beautiful, responsive glassmorphism gallery to view and manage media.
 - **📁 Folder Management**: Organize your photos and videos into subfolders.
@@ -21,7 +23,7 @@ CryptHaven is a fully self-hosted, secure media server that keeps your photos an
 - **🧹 Duplicate Cleaner**: Automatically detect and clean up duplicate files.
 - **☁️ Google Drive Backup**: Optional integration for secure, encrypted cloud backups.
 - **🔑 Secure Access**: Password change support, session auto-lock, and rate limiting.
-- **💻 Windows System Tray Integration**: Manage the server quietly in the background.
+- **💻 Windows System Tray Integration**: Manage the server quietly in the background with quick access to browser, cloud backup, and vault switching.
 
 ## 🖼️ Screenshots
 
@@ -57,11 +59,14 @@ CryptHaven is built from the ground up with security in mind:
    pip install -r requirements.txt
    ```
 
-3. **Run the server:**
+3. **Run the program:**
    ```bash
    python crypthaven_server.py
    ```
-   On first run, you will be prompted to create a secure vault password.
+   The **CryptHaven Vault Launcher** window will open. From here, you can:
+   - Select a previously opened vault from the **Recent Vaults** list.
+   - Click **📁 Open Vault...** to select an existing vault directory.
+   - Click **➕ Create / Transform...** to transform any folder into a new media vault.
 
 4. **Access the Vault:**
    Open your browser and navigate to `https://localhost:8443` or `http://localhost:8080`.
@@ -70,10 +75,13 @@ CryptHaven is built from the ground up with security in mind:
 
 You can customize CryptHaven's behavior using environment variables or command-line arguments:
 
+- **Command-Line Arguments**:
+  - `--vault-dir <path>`: Directly launch the specified vault directory (bypasses launcher UI).
+  - `--headless`: Run in headless mode without opening the GUI launcher window.
 - **Ports**: 
   - HTTP: `CRYPTHAVEN_PORT` (default `8080`)
   - HTTPS: `CRYPTHAVEN_HTTPS_PORT` (default `8443`)
-- **Vault Directory**: `CRYPTHAVEN_VAULT_DIR` — change the storage location (defaults to `./vault` next to the script).
+- **Vault Directory**: `CRYPTHAVEN_VAULT_DIR` — change default storage location for headless mode.
 - **Remote Shutdown**: `CRYPTHAVEN_ENABLE_SHUTDOWN=true` to enable remote PC shutdown (default: `false`).
 - **Max Upload Size**: `CRYPTHAVEN_MAX_UPLOAD_MB` — maximum file upload size in MB (default: `500`).
 - **Auto-Lock Timeout**: The web session will automatically lock after 15 minutes of inactivity.

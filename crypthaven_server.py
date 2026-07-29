@@ -57,22 +57,350 @@ def detect_local_ip():
 
 LOCAL_IP = detect_local_ip()
 
-# ── Vault Path Resolution ─────────────────────────────────────────────────
-if getattr(sys, 'frozen', False):
-    VAULT_FOLDER = os.path.dirname(os.path.abspath(sys.executable))
-else:
-    VAULT_FOLDER = os.environ.get(
-        'CRYPTHAVEN_VAULT_DIR',
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vault')
+# ── Vault Path Management & Dynamic Resolution ──────────────────────────────
+VAULT_FOLDER = ""
+DATA_DIR = ""
+SALT_PATH = ""
+INDEX_PATH = ""
+CERT_PATH = ""
+KEY_PATH = ""
+
+
+def set_vault_folder(folder_path: str):
+    """Dynamically set the active vault folder and resolve associated paths."""
+    global VAULT_FOLDER, DATA_DIR, SALT_PATH, INDEX_PATH, CERT_PATH, KEY_PATH
+    VAULT_FOLDER = os.path.abspath(folder_path)
+    DATA_DIR = os.path.join(VAULT_FOLDER, "data")
+    SALT_PATH = os.path.join(VAULT_FOLDER, "vault_salt.bin")
+    INDEX_PATH = os.path.join(VAULT_FOLDER, "vault_index.json")
+    CERT_PATH = os.path.join(VAULT_FOLDER, "vault_cert.pem")
+    KEY_PATH = os.path.join(VAULT_FOLDER, "vault_key.pem")
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def is_valid_vault(folder_path: str) -> bool:
+    """Check if a directory contains existing CryptHaven vault metadata."""
+    if not folder_path or not os.path.isdir(folder_path):
+        return False
+    salt_exists = os.path.exists(os.path.join(folder_path, "vault_salt.bin"))
+    idx_exists = os.path.exists(os.path.join(folder_path, "vault_index.json"))
+    return salt_exists and idx_exists
+
+
+def initialize_vault_folder(folder_path: str) -> bool:
+    """Prepare a directory structure to serve as a CryptHaven vault."""
+    try:
+        os.makedirs(os.path.join(folder_path, "data"), exist_ok=True)
+        return True
+    except Exception as e:
+        print(f"Error initializing vault folder: {e}")
+        return False
+
+
+def get_config_path() -> str:
+    """Get persistent configuration file path for CryptHaven."""
+    if sys.platform == "win32":
+        base_dir = os.environ.get("APPDATA", os.path.expanduser("~"))
+    else:
+        base_dir = os.path.expanduser("~/.config")
+    config_dir = os.path.join(base_dir, "CryptHaven")
+    os.makedirs(config_dir, exist_ok=True)
+    return os.path.join(config_dir, "config.json")
+
+
+def load_vault_history() -> list:
+    """Load list of recent vault folder paths from config."""
+    cfg_path = get_config_path()
+    history = []
+    if os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                history = data.get("recent_vaults", [])
+        except Exception:
+            pass
+
+    if not history:
+        default_dir = os.environ.get(
+            'CRYPTHAVEN_VAULT_DIR',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vault')
+        )
+        initialize_vault_folder(default_dir)
+        history = [default_dir]
+        save_vault_history(history)
+
+    return history
+
+
+def save_vault_history(history: list):
+    """Save list of recent vault folder paths to config."""
+    cfg_path = get_config_path()
+    try:
+        data = {}
+        if os.path.exists(cfg_path):
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        data["recent_vaults"] = history
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"Failed to save vault history: {e}")
+
+
+def add_to_vault_history(folder_path: str):
+    """Add a vault folder path to the recent vault history."""
+    folder_path = os.path.abspath(folder_path)
+    history = load_vault_history()
+    if folder_path in history:
+        history.remove(folder_path)
+    history.insert(0, folder_path)
+    history = history[:15]
+    save_vault_history(history)
+
+
+def remove_from_vault_history(folder_path: str):
+    """Remove a vault folder path from the recent vault history."""
+    folder_path = os.path.abspath(folder_path)
+    history = load_vault_history()
+    if folder_path in history:
+        history.remove(folder_path)
+        save_vault_history(history)
+
+
+def launch_vault_selector_ui() -> str:
+    """Open Tkinter Vault Selector GUI for choosing or initializing a vault folder."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog, messagebox
+    except ImportError:
+        print("Tkinter GUI not available. Falling back to default vault location.")
+        default_dir = os.environ.get(
+            'CRYPTHAVEN_VAULT_DIR',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vault')
+        )
+        initialize_vault_folder(default_dir)
+        return default_dir
+
+    selected_path = {"val": None}
+
+    root = tk.Tk()
+    root.title("CryptHaven — Vault Launcher")
+    root.geometry("640x480")
+    root.minsize(580, 420)
+    root.configure(bg="#0f172a")
+
+    # Center window on screen and bring to front
+    root.update_idletasks()
+    width = root.winfo_width()
+    height = root.winfo_height()
+    x = (root.winfo_screenwidth() // 2) - (width // 2)
+    y = (root.winfo_screenheight() // 2) - (height // 2)
+    root.geometry(f"+{x}+{y}")
+    root.lift()
+    root.attributes('-topmost', True)
+    root.after_idle(root.attributes, '-topmost', False)
+
+    # Header Frame
+    header_frame = tk.Frame(root, bg="#0f172a", pady=15, padx=20)
+    header_frame.pack(fill="x")
+
+    title_label = tk.Label(
+        header_frame,
+        text="🛡️ CryptHaven Vault Launcher",
+        font=("Segoe UI", 16, "bold"),
+        fg="#38bdf8",
+        bg="#0f172a"
     )
+    title_label.pack(anchor="w")
 
-DATA_DIR = os.path.join(VAULT_FOLDER, "data")
-SALT_PATH = os.path.join(VAULT_FOLDER, "vault_salt.bin")
-INDEX_PATH = os.path.join(VAULT_FOLDER, "vault_index.json")
-CERT_PATH = os.path.join(VAULT_FOLDER, "vault_cert.pem")
-KEY_PATH = os.path.join(VAULT_FOLDER, "vault_key.pem")
+    subtitle_label = tk.Label(
+        header_frame,
+        text="Select an existing media vault or transform a folder into a vault",
+        font=("Segoe UI", 9),
+        fg="#94a3b8",
+        bg="#0f172a"
+    )
+    subtitle_label.pack(anchor="w", pady=(2, 0))
 
-os.makedirs(DATA_DIR, exist_ok=True)
+    # Content Frame
+    content_frame = tk.Frame(root, bg="#0f172a", padx=20)
+    content_frame.pack(fill="both", expand=True)
+
+    history_label = tk.Label(
+        content_frame,
+        text="Recent Vaults",
+        font=("Segoe UI", 11, "bold"),
+        fg="#f8fafc",
+        bg="#0f172a"
+    )
+    history_label.pack(anchor="w", pady=(5, 5))
+
+    list_frame = tk.Frame(content_frame, bg="#1e293b", bd=1, relief="solid")
+    list_frame.pack(fill="both", expand=True, pady=(0, 10))
+
+    scrollbar = tk.Scrollbar(list_frame)
+    scrollbar.pack(side="right", fill="y")
+
+    vault_listbox = tk.Listbox(
+        list_frame,
+        bg="#1e293b",
+        fg="#f8fafc",
+        selectbackground="#0284c7",
+        selectforeground="#ffffff",
+        font=("Consolas", 10),
+        bd=0,
+        highlightthickness=0,
+        yscrollcommand=scrollbar.set
+    )
+    vault_listbox.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+    scrollbar.config(command=vault_listbox.yview)
+
+    history = load_vault_history()
+
+    def refresh_history():
+        vault_listbox.delete(0, tk.END)
+        for item in history:
+            status = "✓ [Vault]" if is_valid_vault(item) else "📁 [Folder]"
+            vault_listbox.insert(tk.END, f"{status} {item}")
+
+    refresh_history()
+    if history:
+        vault_listbox.selection_set(0)
+
+    # Actions Frame
+    btn_frame = tk.Frame(root, bg="#0f172a", padx=20, pady=15)
+    btn_frame.pack(fill="x")
+
+    def on_launch_selected():
+        sel = vault_listbox.curselection()
+        if not sel:
+            messagebox.showwarning("No Selection", "Please select a vault folder from the list or browse for one.", parent=root)
+            return
+        idx = sel[0]
+        path = history[idx]
+        if not os.path.exists(path):
+            messagebox.showerror("Path Not Found", f"The folder does not exist:\n{path}", parent=root)
+            return
+        if not is_valid_vault(path):
+            ans = messagebox.askyesno(
+                "Initialize Vault?",
+                f"The folder:\n{path}\nis not initialized as a CryptHaven vault yet.\n\nDo you want to set it up as a new vault?",
+                parent=root
+            )
+            if not ans:
+                return
+            initialize_vault_folder(path)
+        selected_path["val"] = path
+        root.destroy()
+
+    def on_browse_open():
+        folder = filedialog.askdirectory(title="Select Vault Folder", parent=root)
+        if folder:
+            folder = os.path.abspath(folder)
+            if not is_valid_vault(folder):
+                ans = messagebox.askyesno(
+                    "Initialize New Vault?",
+                    f"The selected folder:\n{folder}\nis not a CryptHaven vault yet.\n\nWould you like to transform it into a vault?",
+                    parent=root
+                )
+                if not ans:
+                    return
+                initialize_vault_folder(folder)
+            selected_path["val"] = folder
+            root.destroy()
+
+    def on_browse_create():
+        folder = filedialog.askdirectory(title="Select Folder to Transform into Vault", parent=root)
+        if folder:
+            folder = os.path.abspath(folder)
+            initialize_vault_folder(folder)
+            selected_path["val"] = folder
+            root.destroy()
+
+    def on_remove_history():
+        sel = vault_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        path = history[idx]
+        remove_from_vault_history(path)
+        del history[idx]
+        refresh_history()
+
+    vault_listbox.bind("<Double-Button-1>", lambda event: on_launch_selected())
+    vault_listbox.bind("<Return>", lambda event: on_launch_selected())
+
+    btn_open = tk.Button(
+        btn_frame,
+        text="📁 Open Vault...",
+        command=on_browse_open,
+        font=("Segoe UI", 10),
+        bg="#334155",
+        fg="#ffffff",
+        activebackground="#475569",
+        activeforeground="#ffffff",
+        bd=0,
+        padx=12,
+        pady=6,
+        cursor="hand2"
+    )
+    btn_open.pack(side="left", padx=(0, 8))
+
+    btn_create = tk.Button(
+        btn_frame,
+        text="➕ Create / Transform...",
+        command=on_browse_create,
+        font=("Segoe UI", 10),
+        bg="#334155",
+        fg="#ffffff",
+        activebackground="#475569",
+        activeforeground="#ffffff",
+        bd=0,
+        padx=12,
+        pady=6,
+        cursor="hand2"
+    )
+    btn_create.pack(side="left", padx=(0, 8))
+
+    btn_remove = tk.Button(
+        btn_frame,
+        text="🗑️ Remove",
+        command=on_remove_history,
+        font=("Segoe UI", 10),
+        bg="#475569",
+        fg="#cbd5e1",
+        activebackground="#64748b",
+        activeforeground="#ffffff",
+        bd=0,
+        padx=10,
+        pady=6,
+        cursor="hand2"
+    )
+    btn_remove.pack(side="left", padx=(0, 8))
+
+    btn_launch = tk.Button(
+        btn_frame,
+        text="🚀 Launch Vault",
+        command=on_launch_selected,
+        font=("Segoe UI", 10, "bold"),
+        bg="#0284c7",
+        fg="#ffffff",
+        activebackground="#0369a1",
+        activeforeground="#ffffff",
+        bd=0,
+        padx=16,
+        pady=6,
+        cursor="hand2"
+    )
+    btn_launch.pack(side="right")
+
+    root.protocol("WM_DELETE_WINDOW", lambda: root.destroy())
+    root.mainloop()
+
+    return selected_path["val"]
 
 # ── Runtime State ──────────────────────────────────────────────────────────
 ACTIVE_SESSIONS = set()
@@ -255,6 +583,10 @@ def perform_google_drive_backup():
     return True, f"✨ Cloud Backup Complete!\nSynced to: {target_backup_dir}", target_backup_dir, copied_files_count, copied_mb
 
 class VaultGalleryHandler(BaseHTTPRequestHandler):
+
+    def address_string(self):
+        """Override to prevent slow/hanging reverse DNS lookups on client IP addresses."""
+        return self.client_address[0]
 
     def log_message(self, format, *args):
         """Safely handle log_message when sys.stderr is None in PyInstaller --noconsole mode."""
@@ -838,6 +1170,14 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
             self.send_html(HTML_LOGIN)
             return
 
+        if parsed.path == '/api/vault_status':
+            is_init = is_valid_vault(VAULT_FOLDER)
+            self.send_json({
+                'initialized': is_init,
+                'vault_name': os.path.basename(VAULT_FOLDER) or "Default Vault"
+            })
+            return
+
         if not self.check_auth():
             self.send_response(302)
             self.send_header('Location', '/login')
@@ -1110,7 +1450,7 @@ HTML_LOGIN = """<!DOCTYPE html>
 <html>
 <head>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-    <title>Sign In</title>
+    <title>CryptHaven Sign In</title>
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
@@ -1129,16 +1469,23 @@ HTML_LOGIN = """<!DOCTYPE html>
             padding: 2.5rem 2rem;
             border-radius: 1.5rem;
             box-shadow: 0 25px 50px -12px rgba(0,0,0,0.7), 0 0 0 1px rgba(56, 189, 248, 0.15);
-            width: 88%; max-width: 330px; text-align: center;
+            width: 88%; max-width: 360px; text-align: center;
         }
         .lock-icon {
-            font-size: 2.2rem; margin-bottom: 1rem; display: inline-block;
+            font-size: 2.2rem; margin-bottom: 0.5rem; display: inline-block;
             filter: drop-shadow(0 0 10px rgba(56, 189, 248, 0.4));
         }
+        h2 { margin: 0 0 0.4rem 0; font-size: 1.35rem; color: #f8fafc; font-weight: 700; }
+        p.sub { margin: 0 0 1.2rem 0; font-size: 0.85rem; color: #94a3b8; line-height: 1.4; }
+        .badge {
+            display: inline-block; background: rgba(56, 189, 248, 0.1); color: #38bdf8;
+            padding: 0.25rem 0.75rem; border-radius: 1rem; font-size: 0.78rem; font-weight: 600;
+            margin-bottom: 0.8rem; border: 1px solid rgba(56, 189, 248, 0.2);
+        }
         input { 
-            width: 100%; padding: 0.95rem; margin-bottom: 1.2rem;
+            width: 100%; padding: 0.9rem; margin-bottom: 0.9rem;
             border-radius: 0.85rem; border: 1px solid rgba(51, 65, 85, 0.8);
-            background: rgba(15, 23, 42, 0.9); color: #fff; font-size: 1.1rem;
+            background: rgba(15, 23, 42, 0.9); color: #fff; font-size: 1.05rem;
             text-align: center; outline: none; transition: all 0.2s ease;
         }
         input:focus { border-color: #38bdf8; box-shadow: 0 0 0 4px rgba(56, 189, 248, 0.15); }
@@ -1147,7 +1494,7 @@ HTML_LOGIN = """<!DOCTYPE html>
             background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);
             color: #fff; font-weight: 700; font-size: 1.05rem; cursor: pointer;
             box-shadow: 0 4px 14px rgba(2, 132, 199, 0.4);
-            transition: all 0.2s ease;
+            transition: all 0.2s ease; margin-top: 0.3rem;
         }
         button:active { transform: scale(0.98); }
         .err { color: #f87171; margin-top: 0.9rem; font-size: 0.85rem; font-weight: 500; }
@@ -1155,27 +1502,91 @@ HTML_LOGIN = """<!DOCTYPE html>
 </head>
 <body>
     <div class="card">
-        <div class="lock-icon">🔑</div>
+        <div class="lock-icon" id="lockIcon">🔑</div>
+        <div class="badge" id="vaultBadge">Loading Vault...</div>
+        <h2 id="cardTitle">Sign In</h2>
+        <p class="sub" id="cardSub">Enter passcode to unlock vault</p>
+        
         <input type="password" id="pwd" placeholder="Passcode" autofocus>
-        <button onclick="login()">Enter</button>
+        <input type="password" id="pwd_confirm" placeholder="Confirm Passcode" style="display: none;">
+        <button id="submitBtn" onclick="login()">Unlock Vault</button>
         <div id="err" class="err"></div>
     </div>
     <script>
+        let isInitialized = true;
+
+        async function checkStatus() {
+            try {
+                const res = await fetch('/api/vault_status');
+                const data = await res.json();
+                isInitialized = data.initialized;
+                document.getElementById('vaultBadge').innerText = '📁 ' + (data.vault_name || 'CryptHaven');
+
+                if (!isInitialized) {
+                    document.getElementById('lockIcon').innerText = '🛡️';
+                    document.getElementById('cardTitle').innerText = 'Initialize New Vault';
+                    document.getElementById('cardSub').innerText = 'Set a master passcode for your new media vault. Make sure to remember this passcode!';
+                    document.getElementById('pwd_confirm').style.display = 'block';
+                    document.getElementById('submitBtn').innerText = 'Initialize Vault & Sign In';
+                } else {
+                    document.getElementById('lockIcon').innerText = '🔑';
+                    document.getElementById('cardTitle').innerText = 'Unlock Vault';
+                    document.getElementById('cardSub').innerText = 'Enter passcode to decrypt media';
+                    document.getElementById('pwd_confirm').style.display = 'none';
+                    document.getElementById('submitBtn').innerText = 'Unlock Vault';
+                }
+            } catch(e) {
+                console.error("Status check failed:", e);
+            }
+        }
+
         async function login() {
             const pwd = document.getElementById('pwd').value;
+            const errEl = document.getElementById('err');
+            errEl.innerText = '';
+
+            if (!pwd) {
+                errEl.innerText = 'Please enter a passcode.';
+                return;
+            }
+
+            if (!isInitialized) {
+                const confirmPwd = document.getElementById('pwd_confirm').value;
+                if (pwd.length < 4) {
+                    errEl.innerText = 'Passcode must be at least 4 characters long.';
+                    return;
+                }
+                if (pwd !== confirmPwd) {
+                    errEl.innerText = 'Passcodes do not match! Please re-check.';
+                    return;
+                }
+            }
+
             const res = await fetch('/login', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/x-www-form-urlencoded'},
                 body: 'password=' + encodeURIComponent(pwd)
             });
             const data = await res.json();
-            if(data.success) { 
-                if(data.token) localStorage.setItem('vault_token', data.token);
+            if (data.success) { 
+                if (data.token) sessionStorage.setItem('vault_token', data.token);
                 window.location.href = '/';
+            } else { 
+                errEl.innerText = data.error || 'Access denied'; 
             }
-            else { document.getElementById('err').innerText = data.error || 'Access denied'; }
         }
-        document.getElementById('pwd').addEventListener('keypress', (e) => { if(e.key === 'Enter') login(); });
+
+        document.getElementById('pwd').addEventListener('keypress', (e) => { 
+            if (e.key === 'Enter') {
+                if (!isInitialized) document.getElementById('pwd_confirm').focus();
+                else login();
+            }
+        });
+        document.getElementById('pwd_confirm').addEventListener('keypress', (e) => { 
+            if (e.key === 'Enter') login(); 
+        });
+
+        checkStatus();
     </script>
 </body>
 </html>"""
@@ -1607,7 +2018,7 @@ HTML_GALLERY = """<!DOCTYPE html>
             options.headers = options.headers || {};
             const urlParams = new URLSearchParams(window.location.search);
             let token = urlParams.get('token');
-            if(!token) token = localStorage.getItem('vault_token');
+            if(!token) token = sessionStorage.getItem('vault_token');
             
             if (token) {
                 options.headers['X-Auth-Token'] = token;
@@ -1617,7 +2028,7 @@ HTML_GALLERY = """<!DOCTYPE html>
             try {
                 const res = await fetch(url, options);
                 if (res && res.status === 401) {
-                    localStorage.removeItem('vault_token');
+                    sessionStorage.removeItem('vault_token');
                     window.location.href = '/login';
                     return null;
                 }
@@ -2259,7 +2670,7 @@ HTML_GALLERY = """<!DOCTYPE html>
 
         async function lockVaultNow() {
             await authFetch('/logout', { method: 'POST' });
-            localStorage.removeItem('vault_token');
+            sessionStorage.removeItem('vault_token');
             window.location.href = '/login';
         }
 
@@ -2448,8 +2859,12 @@ def create_tray_icon_image():
     draw.rectangle((31, 40, 33, 46), fill=(2, 132, 199, 255))
     return image
 
+RESTART_REQUESTED = False
+
+
 def on_open_browser(icon, item):
     webbrowser.open(f"http://127.0.0.1:{PORT}")
+
 
 def on_cloud_backup_action(icon, item):
     success, msg, path, count, copied_mb = perform_google_drive_backup()
@@ -2458,39 +2873,158 @@ def on_cloud_backup_action(icon, item):
     else:
         print(f"--- SYSTEM TRAY CLOUD BACKUP ERROR ---\n{msg}")
 
-def on_exit_server(icon, item):
-    global SERVER_HTTPD, SERVER_HTTPS
-    print("--- EXITING ENCRYPTED VAULT SERVER FROM SYSTEM TRAY ---")
+
+def on_switch_vault(icon, item):
+    global RESTART_REQUESTED
+    print("--- SWITCHING VAULT FROM SYSTEM TRAY ---")
+    RESTART_REQUESTED = True
+    stop_servers()
     if TRAY_ICON:
         TRAY_ICON.stop()
-    if SERVER_HTTPD:
-        SERVER_HTTPD.shutdown()
-    if SERVER_HTTPS:
-        SERVER_HTTPS.shutdown()
+
+
+def on_exit_server(icon, item):
+    global RESTART_REQUESTED
+    RESTART_REQUESTED = False
+    print("--- EXITING ENCRYPTED VAULT SERVER FROM SYSTEM TRAY ---")
+    stop_servers()
+    if TRAY_ICON:
+        TRAY_ICON.stop()
     sys.exit(0)
 
-def start_http_server():
-    global SERVER_HTTPD
-    try:
-        SERVER_HTTPD = ThreadingHTTPServer(('0.0.0.0', PORT), VaultGalleryHandler)
-        SERVER_HTTPD.daemon_threads = True
-        SERVER_HTTPD.serve_forever()
-    except Exception as e:
-        print(f"HTTP Listener Notice: {e}")
 
-def start_https_server():
-    global SERVER_HTTPS
-    if generate_self_signed_ssl_certificate():
+def stop_servers():
+    global SERVER_HTTPD, SERVER_HTTPS
+    lock_vault()
+    if SERVER_HTTPD:
+        try:
+            SERVER_HTTPD.shutdown()
+            SERVER_HTTPD.server_close()
+        except Exception:
+            pass
+        SERVER_HTTPD = None
+    if SERVER_HTTPS:
+        try:
+            SERVER_HTTPS.shutdown()
+            SERVER_HTTPS.server_close()
+        except Exception:
+            pass
+        SERVER_HTTPS = None
+
+
+class ThreadedHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def bind_http_server(start_port):
+    """Bind HTTP listeners across both 127.0.0.1 (for local firewall bypass) and LOCAL_IP (for LAN/mobile access)."""
+    servers = []
+    actual_port = None
+
+    for p in range(start_port, start_port + 20):
+        try:
+            s1 = ThreadedHTTPServer(('127.0.0.1', p), VaultGalleryHandler)
+            servers.append(s1)
+            actual_port = p
+
+            if LOCAL_IP and LOCAL_IP not in ('127.0.0.1', '0.0.0.0'):
+                try:
+                    s2 = ThreadedHTTPServer((LOCAL_IP, p), VaultGalleryHandler)
+                    servers.append(s2)
+                except Exception as e:
+                    print(f"LAN Listener Notice for {LOCAL_IP}:{p}: {e}")
+            break
+        except OSError:
+            servers.clear()
+            continue
+
+    return servers, actual_port
+
+
+def bind_https_server(start_port):
+    """Bind HTTPS listeners across loopback and LAN IP."""
+    if not generate_self_signed_ssl_certificate():
+        return [], None
+
+    servers = []
+    actual_port = None
+
+    for p in range(start_port, start_port + 20):
         try:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ctx.load_cert_chain(certfile=CERT_PATH, keyfile=KEY_PATH)
-            SERVER_HTTPS = ThreadingHTTPServer(('0.0.0.0', HTTPS_PORT), VaultGalleryHandler)
-            SERVER_HTTPS.daemon_threads = True
-            SERVER_HTTPS.socket = ctx.wrap_socket(SERVER_HTTPS.socket, server_side=True)
-            print(f"🔒 ENCRYPTED TLS HTTPS SERVER ONLINE: https://{LOCAL_IP}:{HTTPS_PORT}")
-            SERVER_HTTPS.serve_forever()
+
+            s1 = ThreadedHTTPServer(('127.0.0.1', p), VaultGalleryHandler)
+            s1.socket = ctx.wrap_socket(s1.socket, server_side=True)
+            servers.append(s1)
+            actual_port = p
+
+            if LOCAL_IP and LOCAL_IP not in ('127.0.0.1', '0.0.0.0'):
+                try:
+                    ctx2 = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                    ctx2.load_cert_chain(certfile=CERT_PATH, keyfile=KEY_PATH)
+                    s2 = ThreadedHTTPServer((LOCAL_IP, p), VaultGalleryHandler)
+                    s2.socket = ctx2.wrap_socket(s2.socket, server_side=True)
+                    servers.append(s2)
+                except Exception:
+                    pass
+            break
+        except Exception:
+            servers.clear()
+            continue
+
+    return servers, actual_port
+
+
+def start_servers():
+    global SERVER_HTTPD, SERVER_HTTPS, PORT, HTTPS_PORT
+
+    http_servers, actual_http_port = bind_http_server(PORT)
+    if not http_servers:
+        return False, f"Could not bind HTTP server to any port between {PORT}-{PORT + 20}. Check if another application or CryptHaven instance is already running."
+
+    PORT = actual_http_port
+    SERVER_HTTPD = http_servers[0]
+
+    https_servers, actual_https_port = bind_https_server(HTTPS_PORT)
+    if https_servers:
+        HTTPS_PORT = actual_https_port
+        SERVER_HTTPS = https_servers[0]
+
+    def run_server_instance(srv):
+        try:
+            srv.serve_forever()
+        except Exception:
+            pass
+
+    for srv in http_servers:
+        threading.Thread(target=run_server_instance, args=(srv,), daemon=True).start()
+
+    for srv in https_servers:
+        threading.Thread(target=run_server_instance, args=(srv,), daemon=True).start()
+
+    return True, "Servers started successfully"
+
+    def run_http():
+        try:
+            SERVER_HTTPD.serve_forever()
         except Exception as e:
-            print(f"HTTPS Listener Notice: {e}")
+            print(f"HTTP Server notice: {e}")
+
+    def run_https():
+        if SERVER_HTTPS:
+            try:
+                SERVER_HTTPS.serve_forever()
+            except Exception as e:
+                print(f"HTTPS Server notice: {e}")
+
+    threading.Thread(target=run_http, daemon=True).start()
+    if SERVER_HTTPS:
+        threading.Thread(target=run_https, daemon=True).start()
+
+    return True, "Servers started successfully"
+
 
 def setup_system_tray():
     global TRAY_ICON
@@ -2498,6 +3032,7 @@ def setup_system_tray():
         icon_image = create_tray_icon_image()
         menu = pystray.Menu(
             pystray.MenuItem("🌐 Open Web Gallery", on_open_browser),
+            pystray.MenuItem("🔄 Switch Vault", on_switch_vault),
             pystray.MenuItem("☁️ Cloud Backup to Google Drive", on_cloud_backup_action),
             pystray.MenuItem("🔒 Exit Server", on_exit_server)
         )
@@ -2506,30 +3041,85 @@ def setup_system_tray():
     except Exception as e:
         print(f"System Tray Notice: {e}")
 
-if __name__ == '__main__':
-    generate_self_signed_ssl_certificate()
+
+def run_vault_cycle(selected_vault_dir=None):
+    """Run one cycle of vault selection -> server start -> tray icon loop."""
+    if not selected_vault_dir:
+        selected_vault_dir = launch_vault_selector_ui()
+
+    if not selected_vault_dir:
+        print("No vault selected. Exiting CryptHaven.")
+        return False
+
+    set_vault_folder(selected_vault_dir)
+    add_to_vault_history(selected_vault_dir)
+
+    success, msg = start_servers()
+    if not success:
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("CryptHaven Server Error", msg)
+            root.destroy()
+        except Exception:
+            print(f"Server Startup Error: {msg}")
+        return False
 
     print(f"=======================================================================")
     print(f"🔒 CryptHaven — Encrypted Media Vault Server")
-    print(f"  HTTP Access:  http://{LOCAL_IP}:{PORT}")
-    print(f"  HTTPS Access: https://{LOCAL_IP}:{HTTPS_PORT}")
+    print(f"  HTTP Access:  http://{LOCAL_IP}:{PORT} (or http://127.0.0.1:{PORT})")
+    print(f"  HTTPS Access: https://{LOCAL_IP}:{HTTPS_PORT} (or https://127.0.0.1:{HTTPS_PORT})")
     print(f"  Vault Directory: {VAULT_FOLDER}")
     print(f"  Remote Shutdown: {'ENABLED' if ENABLE_REMOTE_SHUTDOWN else 'disabled'}")
     print(f"=======================================================================")
 
-    http_thread = threading.Thread(target=start_http_server, daemon=True)
-    http_thread.start()
+    # Automatically open default browser to the bound HTTP port
+    def auto_open_browser():
+        time.sleep(0.5)
+        webbrowser.open(f"http://127.0.0.1:{PORT}")
 
-    https_thread = threading.Thread(target=start_https_server, daemon=True)
-    https_thread.start()
+    threading.Thread(target=auto_open_browser, daemon=True).start()
+
+    global RESTART_REQUESTED
+    RESTART_REQUESTED = False
 
     try:
         setup_system_tray()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"System Tray exception: {e}")
 
-    try:
-        while True:
-            time.sleep(1)
-    except (KeyboardInterrupt, SystemExit):
-        print("Server shutdown gracefully.")
+    if not RESTART_REQUESTED and SERVER_HTTPD is not None:
+        try:
+            while SERVER_HTTPD is not None and not RESTART_REQUESTED:
+                time.sleep(1)
+        except (KeyboardInterrupt, SystemExit):
+            print("Server shutdown gracefully.")
+            stop_servers()
+            return False
+
+    stop_servers()
+    return RESTART_REQUESTED
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="CryptHaven — Encrypted Media Vault Server")
+    parser.add_argument("--vault-dir", type=str, help="Path to vault folder (bypasses launcher UI)")
+    parser.add_argument("--headless", action="store_true", help="Run in headless mode without GUI launcher")
+    args = parser.parse_args()
+
+    cli_vault = args.vault_dir
+    if not cli_vault and args.headless:
+        cli_vault = os.environ.get(
+            'CRYPTHAVEN_VAULT_DIR',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vault')
+        )
+
+    target_vault = cli_vault
+    while True:
+        restart = run_vault_cycle(target_vault)
+        target_vault = None
+        if not restart:
+            break
+
