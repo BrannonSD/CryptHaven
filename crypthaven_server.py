@@ -194,6 +194,12 @@ def launch_vault_selector_ui() -> str:
     root.minsize(580, 420)
     root.configure(bg="#0f172a")
 
+    if os.path.exists("app_icon.ico"):
+        try:
+            root.iconbitmap("app_icon.ico")
+        except Exception:
+            pass
+
     # Center window on screen and bring to front
     root.update_idletasks()
     width = root.winfo_width()
@@ -1214,7 +1220,6 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
             is_init = is_valid_vault(VAULT_FOLDER)
             self.send_json({
                 'initialized': is_init,
-                'vault_name': os.path.basename(VAULT_FOLDER) or "Default Vault",
                 'allow_downloads': ALLOW_DOWNLOADS
             })
             return
@@ -1578,7 +1583,6 @@ HTML_LOGIN = """<!DOCTYPE html>
 <body>
     <div class="card">
         <div class="lock-icon" id="lockIcon">🔑</div>
-        <div class="badge" id="vaultBadge">Loading Vault...</div>
         <h2 id="cardTitle">Sign In</h2>
         <p class="sub" id="cardSub">Enter passcode to unlock vault</p>
         
@@ -1595,7 +1599,6 @@ HTML_LOGIN = """<!DOCTYPE html>
                 const res = await fetch('/api/vault_status');
                 const data = await res.json();
                 isInitialized = data.initialized;
-                document.getElementById('vaultBadge').innerText = '📁 ' + (data.vault_name || 'CryptHaven');
 
                 if (!isInitialized) {
                     document.getElementById('lockIcon').innerText = '🛡️';
