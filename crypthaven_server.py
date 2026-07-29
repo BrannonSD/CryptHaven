@@ -271,6 +271,27 @@ def launch_vault_selector_ui() -> str:
     if history:
         vault_listbox.selection_set(0)
 
+    shutdown_var = tk.BooleanVar(value=ENABLE_REMOTE_SHUTDOWN)
+    chk_shutdown = tk.Checkbutton(
+        content_frame,
+        text="🔴 Enable Remote PC Shutdown button in Web UI",
+        variable=shutdown_var,
+        font=("Segoe UI", 9),
+        bg="#0f172a",
+        fg="#cbd5e1",
+        selectcolor="#1e293b",
+        activebackground="#0f172a",
+        activeforeground="#38bdf8",
+        cursor="hand2"
+    )
+    chk_shutdown.pack(anchor="w", pady=(0, 5))
+
+    def finish_launch(path):
+        global ENABLE_REMOTE_SHUTDOWN
+        ENABLE_REMOTE_SHUTDOWN = shutdown_var.get()
+        selected_path["val"] = path
+        root.destroy()
+
     # Actions Frame
     btn_frame = tk.Frame(root, bg="#0f172a", padx=20, pady=15)
     btn_frame.pack(fill="x")
@@ -294,8 +315,7 @@ def launch_vault_selector_ui() -> str:
             if not ans:
                 return
             initialize_vault_folder(path)
-        selected_path["val"] = path
-        root.destroy()
+        finish_launch(path)
 
     def on_browse_open():
         folder = filedialog.askdirectory(title="Select Vault Folder", parent=root)
@@ -310,16 +330,14 @@ def launch_vault_selector_ui() -> str:
                 if not ans:
                     return
                 initialize_vault_folder(folder)
-            selected_path["val"] = folder
-            root.destroy()
+            finish_launch(folder)
 
     def on_browse_create():
         folder = filedialog.askdirectory(title="Select Folder to Transform into Vault", parent=root)
         if folder:
             folder = os.path.abspath(folder)
             initialize_vault_folder(folder)
-            selected_path["val"] = folder
-            root.destroy()
+            finish_launch(folder)
 
     def on_remove_history():
         sel = vault_listbox.curselection()
@@ -1343,7 +1361,8 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
                 'starred_count': starred_count,
                 'potential_duplicates': duplicates_count,
                 'free_disk_gb': f"{free_disk / (1024*1024*1024):.2f} GB",
-                'gdrive_available': gdrive_found
+                'gdrive_available': gdrive_found,
+                'enable_remote_shutdown': ENABLE_REMOTE_SHUTDOWN
             })
             return
 
@@ -2022,7 +2041,7 @@ HTML_GALLERY = """<!DOCTYPE html>
             <button style="background:#8b5cf6; color:#fff; margin-top:0.6rem;" onclick="openFolderManagerModal()">📁 Open Full Folder Manager</button>
             <button style="background:#6366f1; color:#fff; margin-top:0.6rem;" onclick="changePasswordPrompt()">🔑 Change Password</button>
             <button style="background:#0284c7; color:#fff; margin-top:0.6rem;" onclick="exportVaultPrompt()">🔓 Decrypt All Files to PC</button>
-            <button style="background:#dc2626; color:#fff; margin-top:0.6rem;" onclick="shutdownPC()">🔴 Shut Down PC</button>
+            <button id="admin-shutdown-btn" style="background:#dc2626; color:#fff; margin-top:0.6rem; display:none;" onclick="shutdownPC()">🔴 Shut Down PC</button>
             <button style="background:#334155; color:#fff; margin-top:1rem;" onclick="closeModal('admin-modal')">Close Dashboard</button>
         </div>
     </div>
@@ -2394,6 +2413,10 @@ HTML_GALLERY = """<!DOCTYPE html>
                     safeSetText('st-starred-count', (stats.starred_count || 0).toLocaleString());
                     safeSetText('st-duplicates-count', (stats.potential_duplicates || 0).toLocaleString() + " Dups");
                     safeSetText('st-disk-free', stats.free_disk_gb || '0 GB');
+                    const shutdownBtn = document.getElementById('admin-shutdown-btn');
+                    if (shutdownBtn) {
+                        shutdownBtn.style.display = stats.enable_remote_shutdown ? 'block' : 'none';
+                    }
                 }
             } catch(e) {
                 console.log("Stats update error:", e);
@@ -2801,10 +2824,19 @@ HTML_GALLERY = """<!DOCTYPE html>
         }
 
         let navFadeTimer = null;
+        let lastNavTime = 0;
 
         function resetNavFadeTimer() {
             const prevArrow = document.getElementById('v-prev-arrow');
             const nextArrow = document.getElementById('v-next-arrow');
+
+            if (scale > 1.05) {
+                if (prevArrow) prevArrow.classList.add('faded');
+                if (nextArrow) nextArrow.classList.add('faded');
+                if (navFadeTimer) clearTimeout(navFadeTimer);
+                return;
+            }
+
             if (prevArrow) prevArrow.classList.remove('faded');
             if (nextArrow) nextArrow.classList.remove('faded');
 
@@ -2829,12 +2861,16 @@ HTML_GALLERY = """<!DOCTYPE html>
 
         function nextItem(e) {
             if(e) e.preventDefault();
+            lastNavTime = Date.now();
+            lastTapTime = 0;
             resetNavFadeTimer();
             if(currentIndex < files.length - 1) openViewer(currentIndex + 1);
         }
 
         function prevItem(e) {
             if(e) e.preventDefault();
+            lastNavTime = Date.now();
+            lastTapTime = 0;
             resetNavFadeTimer();
             if(currentIndex > 0) openViewer(currentIndex - 1);
         }
@@ -2894,8 +2930,23 @@ HTML_GALLERY = """<!DOCTYPE html>
                     isMultiTouch = true;
                 }
 
+                let touchX = 0;
+                if (e.touches.length === 1) {
+                    touchX = e.touches[0].clientX;
+                    touchStartX = e.touches[0].clientX;
+                    touchStartY = e.touches[0].clientY;
+                    startX = e.touches[0].clientX - pointX;
+                    startY = e.touches[0].clientY - pointY;
+                    if (scale === 1) isMultiTouch = false;
+                }
+
                 const now = Date.now();
-                if (e.touches.length === 1 && now - lastTapTime < 300) {
+                const screenWidth = window.innerWidth;
+                const isSideTapZone = touchX < screenWidth * 0.3 || touchX > screenWidth * 0.7;
+                const recentNav = (now - lastNavTime) < 400;
+
+                // Double tap zoom triggers ONLY in central area when no recent side navigation occurred
+                if (e.touches.length === 1 && !isSideTapZone && !recentNav && (now - lastTapTime < 300)) {
                     if (scale > 1) resetZoom();
                     else {
                         scale = 2.5; pointX = 0; pointY = 0;
@@ -2904,21 +2955,11 @@ HTML_GALLERY = """<!DOCTYPE html>
                     lastTapTime = 0;
                     return;
                 }
-                lastTapTime = now;
 
-                if (e.touches.length === 2) {
-                    isMultiTouch = true;
-                    initialPinchDist = Math.hypot(
-                        e.touches[0].pageX - e.touches[1].pageX,
-                        e.touches[0].pageY - e.touches[1].pageY
-                    );
-                    initialScale = scale;
-                } else if (e.touches.length === 1) {
-                    touchStartX = e.touches[0].clientX;
-                    touchStartY = e.touches[0].clientY;
-                    startX = e.touches[0].clientX - pointX;
-                    startY = e.touches[0].clientY - pointY;
-                    if (scale === 1) isMultiTouch = false;
+                if (isSideTapZone || recentNav) {
+                    lastTapTime = 0;
+                } else {
+                    lastTapTime = now;
                 }
             }, {passive: true});
 
