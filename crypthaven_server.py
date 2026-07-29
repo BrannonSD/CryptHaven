@@ -40,6 +40,7 @@ if sys.stdout is not None and hasattr(sys.stdout, 'reconfigure'):
 # ---------------------------------------------------------------------------
 
 # ── Configuration ──────────────────────────────────────────────────────────
+VERSION = "v0.1.0-alpha"
 PORT = int(os.environ.get('CRYPTHAVEN_PORT', 8080))
 HTTPS_PORT = int(os.environ.get('CRYPTHAVEN_HTTPS_PORT', 8443))
 ALLOW_DOWNLOADS = os.environ.get('CRYPTHAVEN_ALLOW_DOWNLOADS', 'false').lower() == 'true'
@@ -240,7 +241,7 @@ def launch_vault_selector_ui() -> str:
     selected_path = {"val": None}
 
     root = tk.Tk()
-    root.title("CryptHaven — Vault Launcher")
+    root.title(f"CryptHaven — Vault Launcher ({VERSION})")
     root.geometry("640x480")
     root.minsize(580, 420)
     root.configure(bg="#0f172a")
@@ -268,7 +269,7 @@ def launch_vault_selector_ui() -> str:
 
     title_label = tk.Label(
         header_frame,
-        text="🛡️ CryptHaven Vault Launcher",
+        text=f"🛡️ CryptHaven Vault Launcher ({VERSION})",
         font=("Segoe UI", 16, "bold"),
         fg="#38bdf8",
         bg="#0f172a"
