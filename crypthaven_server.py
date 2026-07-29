@@ -1884,8 +1884,13 @@ HTML_GALLERY = """<!DOCTYPE html>
         .v-nav-arrow:hover { background: rgba(30, 41, 59, 0.95); transform: translateY(-50%) scale(1.1); border-color: #38bdf8; }
         .v-nav-arrow.faded { opacity: 0; pointer-events: none; }
 
-        /* DRM Anti-Save & Anti-Screenshot Protection */
-        .no-save img, .no-save video, .no-save .v-full-media, .no-save .v-thumb-placeholder {
+        /* DRM Anti-Save & Anti-Screenshot Protection for Grid & Viewer */
+        .no-save img, 
+        .no-save video, 
+        .no-save .v-full-media, 
+        .no-save .v-thumb-placeholder,
+        .no-save .thumb img,
+        .no-save #grid img {
             -webkit-touch-callout: none !important;
             -webkit-user-select: none !important;
             -khtml-user-select: none !important;
@@ -1894,6 +1899,12 @@ HTML_GALLERY = """<!DOCTYPE html>
             user-select: none !important;
             -webkit-user-drag: none !important;
             user-drag: none !important;
+            pointer-events: none !important;
+        }
+        .no-save .thumb, .no-save #grid {
+            -webkit-touch-callout: none !important;
+            -webkit-user-select: none !important;
+            user-select: none !important;
         }
         @media print {
             body { display: none !important; }
@@ -2177,16 +2188,34 @@ HTML_GALLERY = """<!DOCTYPE html>
             }
         }
 
-        // Anti-Save & Anti-Screenshot Event Interceptors
+        function blurMediaOnCapture() {
+            if (allowDownloads) return;
+            const gridEl = document.getElementById('grid');
+            const vBody = document.getElementById('v-body');
+            if (gridEl) gridEl.style.filter = 'blur(60px) opacity(0)';
+            if (vBody) vBody.style.filter = 'blur(60px) opacity(0)';
+            setTimeout(() => {
+                restoreMediaAfterCapture();
+            }, 1500);
+        }
+
+        function restoreMediaAfterCapture() {
+            const gridEl = document.getElementById('grid');
+            const vBody = document.getElementById('v-body');
+            if (gridEl) gridEl.style.filter = 'none';
+            if (vBody && scale <= 1.05) vBody.style.filter = 'none';
+        }
+
+        // Anti-Save & Anti-Screenshot Event Interceptors for Grid & Lightbox
         document.addEventListener('contextmenu', (e) => {
-            if (!allowDownloads && (e.target.tagName === 'IMG' || e.target.tagName === 'VIDEO' || e.target.closest('#viewer'))) {
+            if (!allowDownloads) {
                 e.preventDefault();
                 return false;
             }
         }, { capture: true });
 
         document.addEventListener('dragstart', (e) => {
-            if (!allowDownloads && (e.target.tagName === 'IMG' || e.target.tagName === 'VIDEO')) {
+            if (!allowDownloads) {
                 e.preventDefault();
                 return false;
             }
@@ -2199,7 +2228,7 @@ HTML_GALLERY = """<!DOCTYPE html>
                     (e.ctrlKey && (e.key === 'p' || e.key === 's')) ||
                     (e.metaKey && (e.key === 'p' || e.key === 's'))) {
                     e.preventDefault();
-                    blurViewerOnCapture();
+                    blurMediaOnCapture();
                     return false;
                 }
             }
@@ -2210,38 +2239,35 @@ HTML_GALLERY = """<!DOCTYPE html>
                 if (navigator.clipboard && navigator.clipboard.writeText) {
                     navigator.clipboard.writeText('');
                 }
-                blurViewerOnCapture();
+                blurMediaOnCapture();
             }
         });
 
-        function blurViewerOnCapture() {
-            const vBody = document.getElementById('v-body');
-            if (vBody) {
-                vBody.style.filter = 'blur(60px) opacity(0)';
-                setTimeout(() => { if (scale <= 1.05) vBody.style.filter = 'none'; }, 1500);
-            }
-        }
-
-        // Mobile App-Switcher & Screenshot Blur Interception (Visibility / Blur Events)
+        // Mobile App-Switcher & Screenshot Blur Interception (Visibility, Pagehide, Blur, TouchCancel Events)
         document.addEventListener('visibilitychange', () => {
-            const vBody = document.getElementById('v-body');
-            if (document.visibilityState === 'hidden' && !allowDownloads) {
-                if (vBody) vBody.style.filter = 'blur(60px) opacity(0)';
-            } else {
-                if (vBody && scale <= 1.05) vBody.style.filter = 'none';
+            if (!allowDownloads) {
+                if (document.visibilityState === 'hidden') {
+                    blurMediaOnCapture();
+                } else {
+                    restoreMediaAfterCapture();
+                }
             }
+        });
+
+        window.addEventListener('pagehide', () => {
+            if (!allowDownloads) blurMediaOnCapture();
         });
 
         window.addEventListener('blur', () => {
-            if (!allowDownloads) {
-                const vBody = document.getElementById('v-body');
-                if (vBody) vBody.style.filter = 'blur(60px) opacity(0)';
-            }
+            if (!allowDownloads) blurMediaOnCapture();
         });
 
         window.addEventListener('focus', () => {
-            const vBody = document.getElementById('v-body');
-            if (vBody && scale <= 1.05) vBody.style.filter = 'none';
+            if (!allowDownloads) restoreMediaAfterCapture();
+        });
+
+        document.addEventListener('touchcancel', () => {
+            if (!allowDownloads) blurMediaOnCapture();
         });
 
         async function init() {
