@@ -12,6 +12,7 @@ import threading
 import webbrowser
 import urllib.parse
 import datetime
+import mimetypes
 import ssl
 import socket
 import argparse
@@ -1443,6 +1444,36 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     print(f"Decryption / Media error for {enc_id}: {e}")
 
+        if parsed.path.startswith('/download/'):
+            enc_id = urllib.parse.unquote(parsed.path[10:])
+            if '?' in enc_id: enc_id = enc_id.split('?')[0]
+            enc_file_path = os.path.join(DATA_DIR, enc_id)
+
+            if os.path.exists(enc_file_path) and ACTIVE_FERNET:
+                try:
+                    with open(enc_file_path, 'rb') as ef: ciphertext = ef.read()
+                    plaintext = ACTIVE_FERNET.decrypt(ciphertext)
+
+                    item = next((x for x in DECRYPTED_INDEX if x['enc_id'] == enc_id), None)
+                    filename = item['name'] if item else 'download'
+                    mime_type, _ = mimetypes.guess_type(filename)
+                    if not mime_type:
+                        mime_type = 'application/octet-stream'
+
+                    safe_filename = urllib.parse.quote(filename)
+
+                    self.send_response(200)
+                    self.inject_security_headers()
+                    self.send_header('Content-Type', mime_type)
+                    self.send_header('Content-Length', str(len(plaintext)))
+                    self.send_header('Content-Disposition', f'attachment; filename="{filename}"; filename*=UTF-8\'\'{safe_filename}')
+                    self.send_header('Cache-Control', 'private, no-cache')
+                    self.end_headers()
+                    self.wfile.write(plaintext)
+                    return
+                except Exception as e:
+                    print(f"Decryption / Download error for {enc_id}: {e}")
+
         self.send_response(404)
         self.end_headers()
 
@@ -1772,6 +1803,8 @@ HTML_GALLERY = """<!DOCTYPE html>
         .v-title { font-size: 0.85rem; color: #cbd5e1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%; }
         .v-hdr-btns { display: flex; gap: 0.4rem; align-items: center; }
         .v-star-btn { background: rgba(51, 65, 85, 0.8); color: #fbbf24; border: none; padding: 0.4rem 0.7rem; border-radius: 0.6rem; font-size: 1rem; cursor: pointer; }
+        .v-dl-btn { background: rgba(51, 65, 85, 0.8); color: #10b981; border: none; padding: 0.4rem 0.7rem; border-radius: 0.6rem; font-size: 1rem; cursor: pointer; transition: all 0.2s ease; }
+        .v-dl-btn:hover { background: rgba(16, 185, 129, 0.3); transform: scale(1.05); }
         .v-opt-btn { background: rgba(51, 65, 85, 0.8); color: #38bdf8; border: none; padding: 0.4rem 0.8rem; border-radius: 0.6rem; font-weight: 700; font-size: 0.85rem; cursor: pointer; }
         .v-close { background: none; border: none; color: #fff; font-size: 1.5rem; padding: 0 0.5rem; cursor: pointer; touch-action: manipulation; }
         
@@ -1790,9 +1823,22 @@ HTML_GALLERY = """<!DOCTYPE html>
             transform-origin: center center; will-change: transform; 
         }
         
-        .v-actions { padding: 1rem; background: rgba(15,23,42,0.95); backdrop-filter: blur(12px); display: flex; justify-content: space-between; align-items: center; gap: 1rem; z-index: 110; }
-        .btn { flex: 1; padding: 0.9rem; border-radius: 0.75rem; border: none; font-weight: 700; font-size: 1.05rem; cursor: pointer; text-align: center; touch-action: manipulation; }
-        .btn-nav { background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%); color: #fff; box-shadow: 0 4px 14px rgba(2, 132, 199, 0.3); }
+        /* Small discreet floating side navigation arrows with auto-fade */
+        .v-nav-arrow {
+            position: absolute; top: 50%; transform: translateY(-50%);
+            width: 42px; height: 42px; border-radius: 50%;
+            background: rgba(15, 23, 42, 0.7); color: #f8fafc;
+            backdrop-filter: blur(8px); border: 1px solid rgba(255, 255, 255, 0.15);
+            display: flex; align-items: center; justify-content: center;
+            font-size: 1.4rem; font-weight: bold; cursor: pointer; z-index: 110;
+            transition: opacity 0.35s ease, transform 0.2s ease, background 0.2s ease;
+            opacity: 1; user-select: none; -webkit-user-select: none;
+            touch-action: manipulation; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+        }
+        .v-prev-arrow { left: 0.8rem; }
+        .v-next-arrow { right: 0.8rem; }
+        .v-nav-arrow:hover { background: rgba(30, 41, 59, 0.95); transform: translateY(-50%) scale(1.1); border-color: #38bdf8; }
+        .v-nav-arrow.faded { opacity: 0; pointer-events: none; }
     </style>
 </head>
 <body>
@@ -1926,6 +1972,8 @@ HTML_GALLERY = """<!DOCTYPE html>
             <h3>⚙️ Item Options</h3>
             <p id="opt-item-name" style="font-size:0.85rem; color:#94a3b8; word-break:break-all;"></p>
             
+            <button style="background:#10b981; color:#fff; font-weight:bold; margin-bottom:1rem;" onclick="closeModal('item-options-modal'); downloadCurrentItem();">⬇️ Download Raw File</button>
+
             <label style="font-size:0.85rem; color:#cbd5e1;">Move to Subfolder:</label>
             <select id="opt-move-folder-select"></select>
             <button style="background:#0284c7; color:#fff;" onclick="submitMoveItem()">📁 Move Item</button>
@@ -1979,20 +2027,19 @@ HTML_GALLERY = """<!DOCTYPE html>
         </div>
     </div>
 
-    <div class="viewer" id="viewer">
+    <div class="viewer" id="viewer" onmousemove="resetNavFadeTimer()" onclick="resetNavFadeTimer()">
         <div class="v-header">
             <div class="v-title" id="v-title"></div>
             <div class="v-hdr-btns">
                 <button class="v-star-btn" id="v-star-btn" onclick="toggleStarItem()">☆</button>
+                <button class="v-dl-btn" id="v-dl-btn" onclick="downloadCurrentItem(event)" title="Download raw media file">⬇️</button>
                 <button class="v-opt-btn" onclick="openItemOptionsModal()">⚙️</button>
                 <button class="v-close" onclick="closeViewer()">✕</button>
             </div>
         </div>
+        <button class="v-nav-arrow v-prev-arrow" id="v-prev-arrow" onclick="event.stopPropagation(); prevItem(event);" title="Previous">‹</button>
+        <button class="v-nav-arrow v-next-arrow" id="v-next-arrow" onclick="event.stopPropagation(); nextItem(event);" title="Next">›</button>
         <div class="v-body" id="v-body"></div>
-        <div class="v-actions">
-            <button class="btn btn-nav" onclick="prevItem(event)">◀ Previous</button>
-            <button class="btn btn-nav" onclick="nextItem(event)">Next ▶</button>
-        </div>
     </div>
 
     <script>
@@ -2010,7 +2057,7 @@ HTML_GALLERY = """<!DOCTYPE html>
         function getTokenParam() {
             const urlParams = new URLSearchParams(window.location.search);
             let token = urlParams.get('token');
-            if(!token) token = localStorage.getItem('vault_token');
+            if(!token) token = sessionStorage.getItem('vault_token') || localStorage.getItem('vault_token');
             return token ? '?token=' + encodeURIComponent(token) : '';
         }
 
@@ -2750,6 +2797,25 @@ HTML_GALLERY = """<!DOCTYPE html>
 
             const viewer = document.getElementById('viewer');
             if(viewer) viewer.classList.add('active');
+            resetNavFadeTimer();
+        }
+
+        let navFadeTimer = null;
+
+        function resetNavFadeTimer() {
+            const prevArrow = document.getElementById('v-prev-arrow');
+            const nextArrow = document.getElementById('v-next-arrow');
+            if (prevArrow) prevArrow.classList.remove('faded');
+            if (nextArrow) nextArrow.classList.remove('faded');
+
+            if (navFadeTimer) clearTimeout(navFadeTimer);
+            navFadeTimer = setTimeout(() => {
+                const viewer = document.getElementById('viewer');
+                if (viewer && viewer.classList.contains('active')) {
+                    if (prevArrow) prevArrow.classList.add('faded');
+                    if (nextArrow) nextArrow.classList.add('faded');
+                }
+            }, 1000);
         }
 
         function closeViewer() {
@@ -2757,18 +2823,49 @@ HTML_GALLERY = """<!DOCTYPE html>
             if(viewer) viewer.classList.remove('active');
             const body = document.getElementById('v-body');
             if(body) body.innerHTML = '';
+            if (navFadeTimer) clearTimeout(navFadeTimer);
             resetZoom();
         }
 
         function nextItem(e) {
             if(e) e.preventDefault();
+            resetNavFadeTimer();
             if(currentIndex < files.length - 1) openViewer(currentIndex + 1);
         }
 
         function prevItem(e) {
             if(e) e.preventDefault();
+            resetNavFadeTimer();
             if(currentIndex > 0) openViewer(currentIndex - 1);
         }
+
+        function downloadCurrentItem(e) {
+            if (e && e.preventDefault) e.preventDefault();
+            if (currentIndex < 0 || currentIndex >= files.length) return;
+            const f = files[currentIndex];
+            if (!f || !f.enc_id) return;
+
+            const tokenParam = getTokenParam();
+            const downloadUrl = '/download/' + encodeURIComponent(f.enc_id) + tokenParam;
+
+            const a = document.createElement('a');
+            a.href = downloadUrl;
+            a.download = f.name || 'download';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+
+        document.addEventListener('keydown', (e) => {
+            const viewer = document.getElementById('viewer');
+            if (viewer && viewer.classList.contains('active')) {
+                resetNavFadeTimer();
+                if (e.key === 'ArrowLeft') prevItem(e);
+                else if (e.key === 'ArrowRight') nextItem(e);
+                else if (e.key === 'Escape') closeViewer();
+                else if (e.key === 'd' || e.key === 'D') downloadCurrentItem(e);
+            }
+        });
 
         async function shutdownPC() {
             if (confirm("Are you sure you want to SHUT DOWN your PC right now?")) {
@@ -2783,9 +2880,20 @@ HTML_GALLERY = """<!DOCTYPE html>
         }
 
         const vBody = document.getElementById('v-body');
+        let touchStartX = 0, touchStartY = 0;
+        let totalTouchMove = 0;
+        let touchStartTime = 0;
 
         if(vBody) {
             vBody.addEventListener('touchstart', e => {
+                resetNavFadeTimer();
+                touchStartTime = Date.now();
+                totalTouchMove = 0;
+
+                if (e.touches.length > 1) {
+                    isMultiTouch = true;
+                }
+
                 const now = Date.now();
                 if (e.touches.length === 1 && now - lastTapTime < 300) {
                     if (scale > 1) resetZoom();
@@ -2806,6 +2914,8 @@ HTML_GALLERY = """<!DOCTYPE html>
                     );
                     initialScale = scale;
                 } else if (e.touches.length === 1) {
+                    touchStartX = e.touches[0].clientX;
+                    touchStartY = e.touches[0].clientY;
                     startX = e.touches[0].clientX - pointX;
                     startY = e.touches[0].clientY - pointY;
                     if (scale === 1) isMultiTouch = false;
@@ -2813,6 +2923,7 @@ HTML_GALLERY = """<!DOCTYPE html>
             }, {passive: true});
 
             vBody.addEventListener('touchmove', e => {
+                resetNavFadeTimer();
                 if (e.touches.length === 2) {
                     isMultiTouch = true;
                     const dist = Math.hypot(
@@ -2821,21 +2932,41 @@ HTML_GALLERY = """<!DOCTYPE html>
                     );
                     scale = Math.min(Math.max(1, initialScale * (dist / initialPinchDist)), 4);
                     requestAnimationFrame(() => updateTransform(false));
-                } else if (e.touches.length === 1 && scale > 1) {
-                    pointX = e.touches[0].clientX - startX;
-                    pointY = e.touches[0].clientY - startY;
-                    requestAnimationFrame(() => updateTransform(false));
+                } else if (e.touches.length === 1) {
+                    const dx = e.touches[0].clientX - touchStartX;
+                    const dy = e.touches[0].clientY - touchStartY;
+                    totalTouchMove = Math.hypot(dx, dy);
+
+                    if (scale > 1) {
+                        pointX = e.touches[0].clientX - startX;
+                        pointY = e.touches[0].clientY - startY;
+                        requestAnimationFrame(() => updateTransform(false));
+                    }
                 }
             }, {passive: true});
 
             vBody.addEventListener('touchend', e => {
                 if (e.touches.length === 0) {
-                    if (scale === 1 && !isMultiTouch) {
+                    const touchDuration = Date.now() - touchStartTime;
+
+                    // Clean side-tap navigation on mobile/touch:
+                    // Only trigger if scale <= 1.05 (not zoomed), no pinch gesture occurred,
+                    // touch movement was minimal (<15px), and touch duration was brief (<400ms).
+                    if (scale <= 1.05 && !isMultiTouch && totalTouchMove < 15 && touchDuration < 400) {
+                        const screenWidth = window.innerWidth;
+                        if (touchStartX < screenWidth * 0.3) {
+                            prevItem();
+                        } else if (touchStartX > screenWidth * 0.7) {
+                            nextItem();
+                        }
+                    } else if (scale === 1 && !isMultiTouch && totalTouchMove > 50) {
                         const diffX = pointX;
                         if (diffX < -60) nextItem();
                         else if (diffX > 60) prevItem();
                     }
+
                     if (scale <= 1.05) resetZoom();
+                    isMultiTouch = false;
                 }
             }, {passive: true});
         }
