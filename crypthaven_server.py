@@ -42,6 +42,7 @@ if sys.stdout is not None and hasattr(sys.stdout, 'reconfigure'):
 # ── Configuration ──────────────────────────────────────────────────────────
 PORT = int(os.environ.get('CRYPTHAVEN_PORT', 8080))
 HTTPS_PORT = int(os.environ.get('CRYPTHAVEN_HTTPS_PORT', 8443))
+ALLOW_DOWNLOADS = os.environ.get('CRYPTHAVEN_ALLOW_DOWNLOADS', 'false').lower() == 'true'
 ENABLE_REMOTE_SHUTDOWN = os.environ.get('CRYPTHAVEN_ENABLE_SHUTDOWN', 'false').lower() == 'true'
 MAX_UPLOAD_BYTES = int(os.environ.get('CRYPTHAVEN_MAX_UPLOAD_MB', 500)) * 1024 * 1024
 
@@ -271,6 +272,21 @@ def launch_vault_selector_ui() -> str:
     if history:
         vault_listbox.selection_set(0)
 
+    download_var = tk.BooleanVar(value=ALLOW_DOWNLOADS)
+    chk_download = tk.Checkbutton(
+        content_frame,
+        text="💾 Allow Media Saving, Downloading & Direct Export (Disabled by default)",
+        variable=download_var,
+        font=("Segoe UI", 9),
+        bg="#0f172a",
+        fg="#cbd5e1",
+        selectcolor="#1e293b",
+        activebackground="#0f172a",
+        activeforeground="#38bdf8",
+        cursor="hand2"
+    )
+    chk_download.pack(anchor="w", pady=(0, 2))
+
     shutdown_var = tk.BooleanVar(value=ENABLE_REMOTE_SHUTDOWN)
     chk_shutdown = tk.Checkbutton(
         content_frame,
@@ -287,7 +303,8 @@ def launch_vault_selector_ui() -> str:
     chk_shutdown.pack(anchor="w", pady=(0, 5))
 
     def finish_launch(path):
-        global ENABLE_REMOTE_SHUTDOWN
+        global ENABLE_REMOTE_SHUTDOWN, ALLOW_DOWNLOADS
+        ALLOW_DOWNLOADS = download_var.get()
         ENABLE_REMOTE_SHUTDOWN = shutdown_var.get()
         selected_path["val"] = path
         root.destroy()
@@ -1147,6 +1164,10 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == '/api/admin/export_vault':
+            if not ALLOW_DOWNLOADS:
+                self.send_json({'success': False, 'error': 'Decrypted media export is disabled for this vault session.'}, status=403)
+                return
+
             export_dir = os.path.join(VAULT_FOLDER, "Exported_Decrypted_Media")
             os.makedirs(export_dir, exist_ok=True)
 
@@ -1193,7 +1214,8 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
             is_init = is_valid_vault(VAULT_FOLDER)
             self.send_json({
                 'initialized': is_init,
-                'vault_name': os.path.basename(VAULT_FOLDER) or "Default Vault"
+                'vault_name': os.path.basename(VAULT_FOLDER) or "Default Vault",
+                'allow_downloads': ALLOW_DOWNLOADS
             })
             return
 
@@ -1464,6 +1486,9 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
                     print(f"Decryption / Media error for {enc_id}: {e}")
 
         if parsed.path.startswith('/download/'):
+            if not ALLOW_DOWNLOADS:
+                self.send_json({'success': False, 'error': 'Media downloading is disabled for this vault session.'}, status=403)
+                return
             enc_id = urllib.parse.unquote(parsed.path[10:])
             if '?' in enc_id: enc_id = enc_id.split('?')[0]
             enc_file_path = os.path.join(DATA_DIR, enc_id)
@@ -1858,6 +1883,21 @@ HTML_GALLERY = """<!DOCTYPE html>
         .v-next-arrow { right: 0.8rem; }
         .v-nav-arrow:hover { background: rgba(30, 41, 59, 0.95); transform: translateY(-50%) scale(1.1); border-color: #38bdf8; }
         .v-nav-arrow.faded { opacity: 0; pointer-events: none; }
+
+        /* DRM Anti-Save & Anti-Screenshot Protection */
+        .no-save img, .no-save video, .no-save .v-full-media, .no-save .v-thumb-placeholder {
+            -webkit-touch-callout: none !important;
+            -webkit-user-select: none !important;
+            -khtml-user-select: none !important;
+            -moz-user-select: none !important;
+            -ms-user-select: none !important;
+            user-select: none !important;
+            -webkit-user-drag: none !important;
+            user-drag: none !important;
+        }
+        @media print {
+            body { display: none !important; }
+        }
     </style>
 </head>
 <body>
@@ -1991,7 +2031,7 @@ HTML_GALLERY = """<!DOCTYPE html>
             <h3>⚙️ Item Options</h3>
             <p id="opt-item-name" style="font-size:0.85rem; color:#94a3b8; word-break:break-all;"></p>
             
-            <button style="background:#10b981; color:#fff; font-weight:bold; margin-bottom:1rem;" onclick="closeModal('item-options-modal'); downloadCurrentItem();">⬇️ Download Raw File</button>
+            <button id="opt-download-btn" style="background:#10b981; color:#fff; font-weight:bold; margin-bottom:1rem; display:none;" onclick="closeModal('item-options-modal'); downloadCurrentItem();">⬇️ Download Raw File</button>
 
             <label style="font-size:0.85rem; color:#cbd5e1;">Move to Subfolder:</label>
             <select id="opt-move-folder-select"></select>
@@ -2051,7 +2091,7 @@ HTML_GALLERY = """<!DOCTYPE html>
             <div class="v-title" id="v-title"></div>
             <div class="v-hdr-btns">
                 <button class="v-star-btn" id="v-star-btn" onclick="toggleStarItem()">☆</button>
-                <button class="v-dl-btn" id="v-dl-btn" onclick="downloadCurrentItem(event)" title="Download raw media file">⬇️</button>
+                <button class="v-dl-btn" id="v-dl-btn" style="display:none;" onclick="downloadCurrentItem(event)" title="Download raw media file">⬇️</button>
                 <button class="v-opt-btn" onclick="openItemOptionsModal()">⚙️</button>
                 <button class="v-close" onclick="closeViewer()">✕</button>
             </div>
@@ -2110,7 +2150,102 @@ HTML_GALLERY = """<!DOCTYPE html>
             if(el) el.innerText = txt;
         }
 
+        let allowDownloads = false;
+
+        async function checkVaultConfig() {
+            try {
+                const res = await authFetch('/api/vault_status');
+                if (res) {
+                    const data = await res.json();
+                    allowDownloads = !!data.allow_downloads;
+                    applyDrmProtections();
+                }
+            } catch(e) {}
+        }
+
+        function applyDrmProtections() {
+            const dlBtn = document.getElementById('v-dl-btn');
+            if (dlBtn) dlBtn.style.display = allowDownloads ? 'flex' : 'none';
+
+            const optDlBtn = document.getElementById('opt-download-btn');
+            if (optDlBtn) optDlBtn.style.display = allowDownloads ? 'block' : 'none';
+
+            if (!allowDownloads) {
+                document.body.classList.add('no-save');
+            } else {
+                document.body.classList.remove('no-save');
+            }
+        }
+
+        // Anti-Save & Anti-Screenshot Event Interceptors
+        document.addEventListener('contextmenu', (e) => {
+            if (!allowDownloads && (e.target.tagName === 'IMG' || e.target.tagName === 'VIDEO' || e.target.closest('#viewer'))) {
+                e.preventDefault();
+                return false;
+            }
+        }, { capture: true });
+
+        document.addEventListener('dragstart', (e) => {
+            if (!allowDownloads && (e.target.tagName === 'IMG' || e.target.tagName === 'VIDEO')) {
+                e.preventDefault();
+                return false;
+            }
+        }, { capture: true });
+
+        // Screenshot Key Interception (PrintScreen, Ctrl+P, Ctrl+S, Cmd+Shift+3/4/5)
+        document.addEventListener('keydown', (e) => {
+            if (!allowDownloads) {
+                if (e.key === 'PrintScreen' || e.code === 'PrintScreen' || 
+                    (e.ctrlKey && (e.key === 'p' || e.key === 's')) ||
+                    (e.metaKey && (e.key === 'p' || e.key === 's'))) {
+                    e.preventDefault();
+                    blurViewerOnCapture();
+                    return false;
+                }
+            }
+        });
+
+        document.addEventListener('keyup', (e) => {
+            if (!allowDownloads && (e.key === 'PrintScreen' || e.code === 'PrintScreen')) {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText('');
+                }
+                blurViewerOnCapture();
+            }
+        });
+
+        function blurViewerOnCapture() {
+            const vBody = document.getElementById('v-body');
+            if (vBody) {
+                vBody.style.filter = 'blur(60px) opacity(0)';
+                setTimeout(() => { if (scale <= 1.05) vBody.style.filter = 'none'; }, 1500);
+            }
+        }
+
+        // Mobile App-Switcher & Screenshot Blur Interception (Visibility / Blur Events)
+        document.addEventListener('visibilitychange', () => {
+            const vBody = document.getElementById('v-body');
+            if (document.visibilityState === 'hidden' && !allowDownloads) {
+                if (vBody) vBody.style.filter = 'blur(60px) opacity(0)';
+            } else {
+                if (vBody && scale <= 1.05) vBody.style.filter = 'none';
+            }
+        });
+
+        window.addEventListener('blur', () => {
+            if (!allowDownloads) {
+                const vBody = document.getElementById('v-body');
+                if (vBody) vBody.style.filter = 'blur(60px) opacity(0)';
+            }
+        });
+
+        window.addEventListener('focus', () => {
+            const vBody = document.getElementById('v-body');
+            if (vBody && scale <= 1.05) vBody.style.filter = 'none';
+        });
+
         async function init() {
+            checkVaultConfig().catch(e => console.error("checkVaultConfig error:", e));
             loadFiles('__ALL__').catch(e => console.error("loadFiles error:", e));
             loadFolders().catch(e => console.error("loadFolders error:", e));
         }
@@ -2416,6 +2551,10 @@ HTML_GALLERY = """<!DOCTYPE html>
                     const shutdownBtn = document.getElementById('admin-shutdown-btn');
                     if (shutdownBtn) {
                         shutdownBtn.style.display = stats.enable_remote_shutdown ? 'block' : 'none';
+                    }
+                    if (stats.allow_downloads !== undefined) {
+                        allowDownloads = !!stats.allow_downloads;
+                        applyDrmProtections();
                     }
                 }
             } catch(e) {
@@ -2820,6 +2959,7 @@ HTML_GALLERY = """<!DOCTYPE html>
 
             const viewer = document.getElementById('viewer');
             if(viewer) viewer.classList.add('active');
+            applyDrmProtections();
             resetNavFadeTimer();
         }
 
@@ -2877,6 +3017,10 @@ HTML_GALLERY = """<!DOCTYPE html>
 
         function downloadCurrentItem(e) {
             if (e && e.preventDefault) e.preventDefault();
+            if (!allowDownloads) {
+                alert("🔒 Media downloading is disabled for this vault session.");
+                return;
+            }
             if (currentIndex < 0 || currentIndex >= files.length) return;
             const f = files[currentIndex];
             if (!f || !f.enc_id) return;
