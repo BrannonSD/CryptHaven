@@ -29,6 +29,8 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from argon2.low_level import hash_secret_raw, Type as Argon2Type
 
 pillow_heif.register_heif_opener()
 if sys.stdout is not None and hasattr(sys.stdout, 'reconfigure'):
@@ -40,12 +42,19 @@ if sys.stdout is not None and hasattr(sys.stdout, 'reconfigure'):
 # ---------------------------------------------------------------------------
 
 # ── Configuration ──────────────────────────────────────────────────────────
-VERSION = "v0.1.0-alpha"
+VERSION = "v0.2.0-alpha"
 PORT = int(os.environ.get('CRYPTHAVEN_PORT', 8080))
 HTTPS_PORT = int(os.environ.get('CRYPTHAVEN_HTTPS_PORT', 8443))
 ALLOW_DOWNLOADS = os.environ.get('CRYPTHAVEN_ALLOW_DOWNLOADS', 'false').lower() == 'true'
 ENABLE_REMOTE_SHUTDOWN = os.environ.get('CRYPTHAVEN_ENABLE_SHUTDOWN', 'false').lower() == 'true'
 MAX_UPLOAD_BYTES = int(os.environ.get('CRYPTHAVEN_MAX_UPLOAD_MB', 500)) * 1024 * 1024
+
+# ── Encryption Constants (v2 — AES-256-GCM) ───────────────────────────────
+VAULT_FORMAT_VERSION = 2
+NONCE_SIZE = 12   # 96-bit nonce for AES-256-GCM (NIST SP 800-38D)
+DEK_SIZE = 32     # 256-bit data encryption key
+KEK_SALT_SIZE = 32  # 256-bit salt for Argon2id
+
 
 
 def detect_local_ip():
@@ -116,17 +125,19 @@ VAULT_FOLDER = ""
 DATA_DIR = ""
 SALT_PATH = ""
 INDEX_PATH = ""
+DEK_PATH = ""
 CERT_PATH = ""
 KEY_PATH = ""
 
 
 def set_vault_folder(folder_path: str):
     """Dynamically set the active vault folder and resolve associated paths."""
-    global VAULT_FOLDER, DATA_DIR, SALT_PATH, INDEX_PATH, CERT_PATH, KEY_PATH
+    global VAULT_FOLDER, DATA_DIR, SALT_PATH, INDEX_PATH, CERT_PATH, KEY_PATH, DEK_PATH
     VAULT_FOLDER = os.path.abspath(folder_path)
     DATA_DIR = os.path.join(VAULT_FOLDER, "data")
     SALT_PATH = os.path.join(VAULT_FOLDER, "vault_salt.bin")
     INDEX_PATH = os.path.join(VAULT_FOLDER, "vault_index.json")
+    DEK_PATH = os.path.join(VAULT_FOLDER, "vault_dek.bin")
     CERT_PATH = os.path.join(VAULT_FOLDER, "vault_cert.pem")
     KEY_PATH = os.path.join(VAULT_FOLDER, "vault_key.pem")
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -138,7 +149,8 @@ def is_valid_vault(folder_path: str) -> bool:
         return False
     salt_exists = os.path.exists(os.path.join(folder_path, "vault_salt.bin"))
     idx_exists = os.path.exists(os.path.join(folder_path, "vault_index.json"))
-    return salt_exists and idx_exists
+    dek_exists = os.path.exists(os.path.join(folder_path, "vault_dek.bin"))
+    return (salt_exists and idx_exists) or (salt_exists and dek_exists and idx_exists)
 
 
 def initialize_vault_folder(folder_path: str) -> bool:
@@ -497,8 +509,9 @@ def launch_vault_selector_ui() -> str:
     return selected_path["val"]
 
 # ── Runtime State ──────────────────────────────────────────────────────────
-ACTIVE_SESSIONS = set()
-ACTIVE_FERNET = None
+ACTIVE_SESSIONS = {}
+ACTIVE_FERNET = None   # Legacy — kept for Fernet migration fallback
+ACTIVE_DEK = None      # v2 — the active Data Encryption Key (AES-256-GCM)
 DECRYPTED_INDEX = []
 ENC_ID_LOOKUP = {}  # enc_id -> item dict for O(1) lookups
 LAST_ACTIVITY_TIME = time.time()
@@ -560,6 +573,57 @@ def generate_self_signed_ssl_certificate():
         print(f"SSL Generation Warning: {e}")
         return False
 
+# ── v2 Encryption Core (AES-256-GCM + DEK/KEK) ───────────────────────────
+
+def derive_kek(password: str, salt: bytes) -> bytes:
+    """Derive a 256-bit Key Encryption Key from password using Argon2id."""
+    return hash_secret_raw(
+        secret=password.encode('utf-8'),
+        salt=salt,
+        time_cost=3,
+        memory_cost=65536,  # 64 MB
+        parallelism=4,
+        hash_len=32,
+        type=Argon2Type.ID
+    )
+
+def generate_dek() -> bytes:
+    """Generate a random 256-bit Data Encryption Key."""
+    return secrets.token_bytes(DEK_SIZE)
+
+def wrap_dek(dek: bytes, kek: bytes) -> bytes:
+    """Encrypt the DEK with the KEK using AES-256-GCM. Returns nonce(12) + ciphertext+tag."""
+    nonce = secrets.token_bytes(NONCE_SIZE)
+    aesgcm = AESGCM(kek)
+    ciphertext = aesgcm.encrypt(nonce, dek, None)
+    return nonce + ciphertext
+
+def unwrap_dek(wrapped: bytes, kek: bytes) -> bytes:
+    """Decrypt the DEK using the KEK. Input: nonce(12) + ciphertext+tag."""
+    nonce = wrapped[:NONCE_SIZE]
+    ciphertext = wrapped[NONCE_SIZE:]
+    aesgcm = AESGCM(kek)
+    return aesgcm.decrypt(nonce, ciphertext, None)
+
+def vault_encrypt(plaintext: bytes, dek: bytes) -> bytes:
+    """Encrypt with AES-256-GCM. Returns: version(1) + nonce(12) + ciphertext+tag."""
+    nonce = secrets.token_bytes(NONCE_SIZE)
+    aesgcm = AESGCM(dek)
+    ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+    return b'\x02' + nonce + ciphertext
+
+def vault_decrypt(data: bytes, dek: bytes, fernet_fallback=None) -> bytes:
+    """Decrypt data. Auto-detects: version 0x02 = AES-256-GCM, otherwise Fernet fallback."""
+    if len(data) > 0 and data[0:1] == b'\x02':
+        nonce = data[1:1 + NONCE_SIZE]
+        ciphertext = data[1 + NONCE_SIZE:]
+        aesgcm = AESGCM(dek)
+        return aesgcm.decrypt(nonce, ciphertext, None)
+    else:
+        if fernet_fallback is not None:
+            return fernet_fallback.decrypt(data)
+        raise ValueError("Legacy Fernet format detected but no fallback key provided")
+
 def derive_key(password: str, salt: bytes) -> bytes:
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
@@ -570,75 +634,176 @@ def derive_key(password: str, salt: bytes) -> bytes:
     return base64.urlsafe_b64encode(kdf.derive(password.encode('utf-8')))
 
 def save_index():
-    if ACTIVE_FERNET and DECRYPTED_INDEX is not None:
+    """Save the decrypted index to disk, encrypted with the active key."""
+    if DECRYPTED_INDEX is not None:
         new_json_bytes = json.dumps(DECRYPTED_INDEX, indent=2).encode('utf-8')
-        ciphertext = ACTIVE_FERNET.encrypt(new_json_bytes)
+        if ACTIVE_DEK is not None:
+            ciphertext = vault_encrypt(new_json_bytes, ACTIVE_DEK)
+        elif ACTIVE_FERNET is not None:
+            ciphertext = ACTIVE_FERNET.encrypt(new_json_bytes)
+        else:
+            return  # No active key — cannot save
         with open(INDEX_PATH, 'wb') as idx_f:
             idx_f.write(ciphertext)
 
+def sanitize_decrypted_index():
+    """Ensure every item in DECRYPTED_INDEX has valid, non-null properties."""
+    global DECRYPTED_INDEX, ENC_ID_LOOKUP
+    valid_items = []
+    for item in DECRYPTED_INDEX:
+        if not isinstance(item, dict):
+            continue
+        if not item.get('enc_id'):
+            item['enc_id'] = f"enc_{secrets.token_hex(8)}.enc"
+        if not item.get('name'):
+            item['name'] = 'unnamed'
+        if item.get('subfolder') is None:
+            item['subfolder'] = ''
+        if 'starred' not in item or item['starred'] is None:
+            item['starred'] = False
+        if 'enc_thumb_id' not in item:
+            item['enc_thumb_id'] = None
+        if 'is_live_photo' not in item or item['is_live_photo'] is None:
+            item['is_live_photo'] = False
+        if 'is_video' not in item or item['is_video'] is None:
+            item['is_video'] = False
+        if 'size' not in item or item['size'] is None:
+            item['size'] = 0
+        if 'mtime' not in item or item['mtime'] is None:
+            item['mtime'] = 0
+        valid_items.append(item)
+
+    DECRYPTED_INDEX = valid_items
+    ENC_ID_LOOKUP = {item['enc_id']: item for item in DECRYPTED_INDEX}
+
 def load_vault(password: str):
-    global ACTIVE_FERNET, DECRYPTED_INDEX, ENC_ID_LOOKUP, LAST_ACTIVITY_TIME
-    
-    if not os.path.exists(SALT_PATH) or not os.path.exists(INDEX_PATH):
-        salt = secrets.token_bytes(16)
-        with open(SALT_PATH, 'wb') as sf: sf.write(salt)
-        key = derive_key(password, salt)
-        fernet = Fernet(key)
+    """Unlock or initialize a vault. Supports v2 (AES-256-GCM) and legacy (Fernet)."""
+    global ACTIVE_FERNET, ACTIVE_DEK, DECRYPTED_INDEX, ENC_ID_LOOKUP, LAST_ACTIVITY_TIME
+
+    is_new_vault = not os.path.exists(SALT_PATH) or not os.path.exists(INDEX_PATH)
+    is_v2_vault = os.path.exists(DEK_PATH)
+
+    # ── NEW VAULT CREATION (v2) ──
+    if is_new_vault:
+        salt = secrets.token_bytes(KEK_SALT_SIZE)
+        with open(SALT_PATH, 'wb') as sf:
+            sf.write(salt)
+
+        dek = generate_dek()
+        kek = derive_kek(password, salt)
+        wrapped = wrap_dek(dek, kek)
+        with open(DEK_PATH, 'wb') as df:
+            df.write(wrapped)
+
+        ACTIVE_DEK = dek
+        ACTIVE_FERNET = None
         DECRYPTED_INDEX = []
         ENC_ID_LOOKUP = {}
-        ciphertext = fernet.encrypt(json.dumps(DECRYPTED_INDEX).encode('utf-8'))
-        with open(INDEX_PATH, 'wb') as idx_f: idx_f.write(ciphertext)
-        
-        ACTIVE_FERNET = fernet
+
+        ciphertext = vault_encrypt(json.dumps(DECRYPTED_INDEX).encode('utf-8'), dek)
+        with open(INDEX_PATH, 'wb') as idx_f:
+            idx_f.write(ciphertext)
+
         LAST_ACTIVITY_TIME = time.time()
         return True, "Vault initialized & unlocked"
 
+    # ── OPEN EXISTING V2 VAULT ──
+    if is_v2_vault:
+        with open(SALT_PATH, 'rb') as sf:
+            salt = sf.read()
+        with open(DEK_PATH, 'rb') as df:
+            wrapped_dek = df.read()
+
+        try:
+            kek = derive_kek(password, salt)
+            dek = unwrap_dek(wrapped_dek, kek)
+        except Exception:
+            return False, "Invalid Password"
+
+        try:
+            with open(INDEX_PATH, 'rb') as idx_f:
+                ciphertext = idx_f.read()
+            plaintext = vault_decrypt(ciphertext, dek)
+            DECRYPTED_INDEX = json.loads(plaintext.decode('utf-8'))
+        except Exception as e:
+            return False, f"Invalid Password ({e})"
+
+        sanitize_decrypted_index()
+        ACTIVE_DEK = dek
+        ACTIVE_FERNET = None
+        LAST_ACTIVITY_TIME = time.time()
+        return True, "Vault unlocked successfully"
+
+    # ── OPEN LEGACY FERNET VAULT ──
     with open(SALT_PATH, 'rb') as sf:
         salt = sf.read()
-        
+
     key = derive_key(password, salt)
     fernet = Fernet(key)
-    
+
     try:
         with open(INDEX_PATH, 'rb') as idx_f:
             ciphertext = idx_f.read()
         plaintext = fernet.decrypt(ciphertext)
         DECRYPTED_INDEX = json.loads(plaintext.decode('utf-8'))
-        
-        for item in DECRYPTED_INDEX:
-            if 'starred' not in item: item['starred'] = False
-            if 'enc_thumb_id' not in item: item['enc_thumb_id'] = None
-            if 'is_live_photo' not in item: item['is_live_photo'] = False
-
-        ENC_ID_LOOKUP = {item['enc_id']: item for item in DECRYPTED_INDEX}
-        ACTIVE_FERNET = fernet
-        LAST_ACTIVITY_TIME = time.time()
-        return True, "Vault unlocked successfully"
     except Exception as e:
         return False, f"Invalid Password ({e})"
 
+    sanitize_decrypted_index()
+    ACTIVE_FERNET = fernet
+    ACTIVE_DEK = None  # Will be set after migration
+    LAST_ACTIVITY_TIME = time.time()
+    return True, "Vault unlocked successfully (legacy format — migration available)"
+
 def lock_vault():
-    global ACTIVE_FERNET, DECRYPTED_INDEX, ENC_ID_LOOKUP
+    """Lock the vault — clear all keys and session state from memory."""
+    global ACTIVE_FERNET, ACTIVE_DEK, DECRYPTED_INDEX, ENC_ID_LOOKUP
     ACTIVE_FERNET = None
+    ACTIVE_DEK = None
     DECRYPTED_INDEX = []
     ENC_ID_LOOKUP = {}
     ACTIVE_SESSIONS.clear()
 
-def find_google_drive_folder():
-    """Detect Google Drive mounted folder on Windows."""
-    candidates = []
-    for letter in string.ascii_uppercase:
-        candidates.append(f"{letter}:\\My Drive")
-        candidates.append(f"{letter}:\\Google Drive")
-    
-    user_home = os.path.expanduser('~')
-    candidates.append(os.path.join(user_home, "Google Drive", "My Drive"))
-    candidates.append(os.path.join(user_home, "Google Drive"))
-    candidates.append(os.path.join(user_home, "My Drive"))
+GDRIVE_CACHE_PATH = None
+GDRIVE_CACHE_TIME = 0
 
-    for path in candidates:
+def find_google_drive_folder():
+    """Detect Google Drive mounted folder on Windows (cached for 60s)."""
+    global GDRIVE_CACHE_PATH, GDRIVE_CACHE_TIME
+    now = time.time()
+    if GDRIVE_CACHE_PATH is not None and (now - GDRIVE_CACHE_TIME < 60):
+        if os.path.exists(GDRIVE_CACHE_PATH):
+            return GDRIVE_CACHE_PATH
+
+    user_home = os.path.expanduser('~')
+    fast_candidates = [
+        os.path.join(user_home, "Google Drive", "My Drive"),
+        os.path.join(user_home, "Google Drive"),
+        os.path.join(user_home, "My Drive"),
+        "G:\\My Drive",
+        "G:\\Google Drive",
+        "GDrive:\\My Drive"
+    ]
+    for path in fast_candidates:
         if os.path.exists(path) and os.path.isdir(path):
+            GDRIVE_CACHE_PATH = path
+            GDRIVE_CACHE_TIME = now
             return path
+
+    for letter in string.ascii_uppercase:
+        p1 = f"{letter}:\\My Drive"
+        p2 = f"{letter}:\\Google Drive"
+        if os.path.exists(p1) and os.path.isdir(p1):
+            GDRIVE_CACHE_PATH = p1
+            GDRIVE_CACHE_TIME = now
+            return p1
+        if os.path.exists(p2) and os.path.isdir(p2):
+            GDRIVE_CACHE_PATH = p2
+            GDRIVE_CACHE_TIME = now
+            return p2
+
+    GDRIVE_CACHE_PATH = None
+    GDRIVE_CACHE_TIME = now
     return None
 
 def perform_google_drive_backup():
@@ -654,7 +819,11 @@ def perform_google_drive_backup():
     copied_files_count = 0
     total_bytes_copied = 0
 
-    for main_file in [SALT_PATH, INDEX_PATH]:
+    main_files = [SALT_PATH, INDEX_PATH]
+    if os.path.exists(DEK_PATH):
+        main_files.append(DEK_PATH)
+
+    for main_file in main_files:
         if os.path.exists(main_file):
             dest_file = os.path.join(target_backup_dir, os.path.basename(main_file))
             if not os.path.exists(dest_file) or os.path.getmtime(main_file) > os.path.getmtime(dest_file):
@@ -674,7 +843,14 @@ def perform_google_drive_backup():
                     total_bytes_copied += os.path.getsize(src_p)
 
     copied_mb = f"{total_bytes_copied / (1024*1024):.2f} MB"
-    return True, f"✨ Cloud Backup Complete!\nSynced to: {target_backup_dir}", target_backup_dir, copied_files_count, copied_mb
+    return True, f"Cloud backup complete to {target_backup_dir}", target_backup_dir, copied_files_count, copied_mb
+def safe_vault_path(filename: str) -> str:
+    """Resolve a filename within DATA_DIR, preventing path traversal."""
+    full_path = os.path.abspath(os.path.join(DATA_DIR, filename))
+    if not full_path.startswith(os.path.abspath(DATA_DIR) + os.sep) and full_path != os.path.abspath(DATA_DIR):
+        raise ValueError("Path traversal blocked")
+    return full_path
+
 
 class VaultGalleryHandler(BaseHTTPRequestHandler):
 
@@ -700,6 +876,7 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
         self.send_header('X-XSS-Protection', '1; mode=block')
         self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('Content-Security-Policy', "default-src 'self' 'unsafe-inline' data: blob:")
+        self.send_header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
 
     def check_rate_limit(self, client_ip):
         now = time.time()
@@ -722,6 +899,14 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
                 if FAILED_LOGINS[client_ip]['count'] >= 5:
                     FAILED_LOGINS[client_ip]['lockout_until'] = now + 900
 
+    def is_https_request(self) -> bool:
+        """Check if request is over HTTPS."""
+        if hasattr(self, 'request') and isinstance(self.request, ssl.SSLSocket):
+            return True
+        if self.headers.get('X-Forwarded-Proto', '').lower() == 'https':
+            return True
+        return False
+
     def check_auth(self):
         global LAST_ACTIVITY_TIME
         now = time.time()
@@ -730,7 +915,7 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
             lock_vault()
             return False
 
-        if ACTIVE_FERNET is None:
+        if ACTIVE_FERNET is None and ACTIVE_DEK is None:
             return False
 
         cookie_header = self.headers.get('Cookie')
@@ -743,13 +928,6 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
 
         auth_hdr = self.headers.get('X-Auth-Token')
         if auth_hdr and auth_hdr in ACTIVE_SESSIONS:
-            LAST_ACTIVITY_TIME = now
-            return True
-
-        parsed = urllib.parse.urlparse(self.path)
-        query = urllib.parse.parse_qs(parsed.query)
-        url_token = query.get('token', [''])[0]
-        if url_token and url_token in ACTIVE_SESSIONS:
             LAST_ACTIVITY_TIME = now
             return True
 
@@ -787,7 +965,7 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self):
-        global ACTIVE_FERNET
+        global ACTIVE_FERNET, ACTIVE_DEK
         client_ip = self.client_address[0]
         parsed = urllib.parse.urlparse(self.path)
         
@@ -802,21 +980,41 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
             params = urllib.parse.parse_qs(body)
             pwd = params.get('password', [''])[0]
             success, msg = load_vault(pwd)
+
+            accept_hdr = self.headers.get('Accept', '')
+            is_ajax = 'application/json' in accept_hdr or self.headers.get('X-Requested-With') == 'XMLHttpRequest'
+
             if success:
                 if client_ip in FAILED_LOGINS: FAILED_LOGINS[client_ip] = {'count': 0, 'lockout_until': 0}
                 
                 new_session_token = secrets.token_hex(16)
-                ACTIVE_SESSIONS.add(new_session_token)
+                csrf_token = secrets.token_hex(32)
+                ACTIVE_SESSIONS[new_session_token] = {'csrf': csrf_token, 'created': time.time()}
 
-                self.send_response(200)
-                self.inject_security_headers()
-                self.send_header('Set-Cookie', f'auth_session={new_session_token}; Path=/; HttpOnly; SameSite=Strict')
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({'success': True, 'token': new_session_token}).encode('utf-8'))
+                is_https = self.is_https_request()
+                secure_attr = "; Secure" if is_https else ""
+
+                if is_ajax:
+                    self.send_response(200)
+                    self.inject_security_headers()
+                    self.send_header('Set-Cookie', f'auth_session={new_session_token}; Path=/; HttpOnly; Secure; SameSite=Strict')
+                    self.send_header('Set-Cookie', f'csrf_token={csrf_token}; Path=/; Secure; SameSite=Strict')
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({'success': True}).encode('utf-8'))
+                else:
+                    self.send_response(302)
+                    self.inject_security_headers()
+                    self.send_header('Set-Cookie', f'auth_session={new_session_token}; Path=/; HttpOnly; Secure; SameSite=Strict')
+                    self.send_header('Set-Cookie', f'csrf_token={csrf_token}; Path=/; Secure; SameSite=Strict')
+                    self.send_header('Location', '/')
+                    self.end_headers()
             else:
                 self.record_failed_login(client_ip)
-                self.send_json({'success': False, 'error': 'Access denied'}, status=401)
+                if is_ajax:
+                    self.send_json({'success': False, 'error': 'Access denied'}, status=401)
+                else:
+                    self.send_html(HTML_LOGIN.replace('id="err" class="err"></div>', 'id="err" class="err">Invalid Passcode</div>'), status=401)
             return
 
         if parsed.path == '/logout':
@@ -824,10 +1022,10 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
             if cookie_header:
                 cookies = dict(c.strip().split('=', 1) for c in cookie_header.split(';') if '=' in c)
                 st = cookies.get('auth_session')
-                if st in ACTIVE_SESSIONS: ACTIVE_SESSIONS.remove(st)
+                if st in ACTIVE_SESSIONS: ACTIVE_SESSIONS.pop(st, None)
             
             auth_hdr = self.headers.get('X-Auth-Token')
-            if auth_hdr in ACTIVE_SESSIONS: ACTIVE_SESSIONS.remove(auth_hdr)
+            if auth_hdr in ACTIVE_SESSIONS: ACTIVE_SESSIONS.pop(auth_hdr, None)
 
             self.send_json({'success': True, 'message': 'Logged out!'})
             return
@@ -835,6 +1033,19 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
         if not self.check_auth():
             self.send_json({'error': 'Unauthorized'}, status=401)
             return
+
+        # CSRF validation for state-changing requests
+        csrf_header = self.headers.get('X-CSRF-Token', '')
+        session_cookie = ''
+        cookie_header = self.headers.get('Cookie')
+        if cookie_header:
+            cookies = dict(c.strip().split('=', 1) for c in cookie_header.split(';') if '=' in c)
+            session_cookie = cookies.get('auth_session', '')
+        if session_cookie in ACTIVE_SESSIONS:
+            expected_csrf = ACTIVE_SESSIONS[session_cookie].get('csrf', '')
+            if csrf_header != expected_csrf:
+                self.send_json({'error': 'CSRF token invalid'}, status=403)
+                return
 
         if parsed.path == '/api/admin/cloud_backup':
             success, message, path, count, copied_mb = perform_google_drive_backup()
@@ -1017,7 +1228,7 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
 
         # 1-Click Cryptographic SHA-256 Hash Duplicate Cleaner (Zero False-Positives Guarantee!)
         if parsed.path == '/api/admin/auto_clean_all_duplicates':
-            if not ACTIVE_FERNET:
+            if not ACTIVE_DEK and not ACTIVE_FERNET:
                 self.send_json({'success': False, 'error': 'Vault locked'}, status=401)
                 return
 
@@ -1028,7 +1239,7 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
                 if os.path.exists(enc_fpath):
                     try:
                         with open(enc_fpath, 'rb') as ef: ciphertext = ef.read()
-                        plaintext = ACTIVE_FERNET.decrypt(ciphertext)
+                        plaintext = vault_decrypt(ciphertext, ACTIVE_DEK, fernet_fallback=ACTIVE_FERNET) if ACTIVE_DEK else ACTIVE_FERNET.decrypt(ciphertext)
                         content_hash = hashlib.sha256(plaintext).hexdigest()
                         hash_map[content_hash].append(item)
                     except Exception:
@@ -1163,11 +1374,11 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
                                 filename = line.split('filename="')[1].split('"')[0]
                         file_bytes = content_part
 
-                if filename and file_bytes and ACTIVE_FERNET:
+                if filename and file_bytes and (ACTIVE_DEK or ACTIVE_FERNET):
                     enc_id = f"enc_{len(DECRYPTED_INDEX):06d}_{int(time.time())}.enc"
                     enc_fpath = os.path.join(DATA_DIR, enc_id)
 
-                    ciphertext = ACTIVE_FERNET.encrypt(file_bytes)
+                    ciphertext = vault_encrypt(file_bytes, ACTIVE_DEK) if ACTIVE_DEK else ACTIVE_FERNET.encrypt(file_bytes)
                     with open(enc_fpath, 'wb') as ef:
                         ef.write(ciphertext)
 
@@ -1203,22 +1414,134 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(length).decode('utf-8') if length > 0 else ""
             params = urllib.parse.parse_qs(body)
+            old_pwd = params.get('old_password', [''])[0]
             new_pwd = params.get('new_password', [''])[0]
 
-            if new_pwd and ACTIVE_FERNET:
-                with open(SALT_PATH, 'rb') as sf: salt = sf.read()
-                new_key = derive_key(new_pwd, salt)
-                new_fernet = Fernet(new_key)
-                
-                new_json_bytes = json.dumps(DECRYPTED_INDEX, indent=2).encode('utf-8')
-                with open(INDEX_PATH, 'wb') as idx_f:
-                    idx_f.write(new_fernet.encrypt(new_json_bytes))
-                
-                ACTIVE_FERNET = new_fernet
-                self.send_json({'success': True, 'message': 'Master password changed successfully!'})
+            if not old_pwd or not new_pwd:
+                self.send_json({'success': False, 'error': 'Both old and new passwords are required.'}, status=400)
                 return
 
-            self.send_json({'success': False, 'error': 'Invalid new password'}, status=400)
+            if len(new_pwd) < 8:
+                self.send_json({'success': False, 'error': 'New password must be at least 8 characters.'}, status=400)
+                return
+
+            if not ACTIVE_DEK and not ACTIVE_FERNET:
+                self.send_json({'success': False, 'error': 'Vault is locked.'}, status=401)
+                return
+
+            # Verify old password
+            with open(SALT_PATH, 'rb') as sf:
+                old_salt = sf.read()
+
+            if ACTIVE_DEK:
+                # v2 vault — verify by attempting to unwrap DEK
+                try:
+                    old_kek = derive_kek(old_pwd, old_salt)
+                    with open(DEK_PATH, 'rb') as df:
+                        wrapped = df.read()
+                    unwrap_dek(wrapped, old_kek)  # Will raise if wrong password
+                except Exception:
+                    self.send_json({'success': False, 'error': 'Current password is incorrect.'}, status=403)
+                    return
+
+                # Generate new salt and KEK, re-wrap the SAME DEK
+                new_salt = secrets.token_bytes(KEK_SALT_SIZE)
+                new_kek = derive_kek(new_pwd, new_salt)
+                new_wrapped = wrap_dek(ACTIVE_DEK, new_kek)
+
+                with open(SALT_PATH, 'wb') as sf:
+                    sf.write(new_salt)
+                with open(DEK_PATH, 'wb') as df:
+                    df.write(new_wrapped)
+
+                self.send_json({'success': True, 'message': 'Master password changed successfully!'})
+            else:
+                # Legacy Fernet vault — verify by attempting decrypt
+                try:
+                    old_key = derive_key(old_pwd, old_salt)
+                    test_fernet = Fernet(old_key)
+                    with open(INDEX_PATH, 'rb') as idx_f:
+                        test_fernet.decrypt(idx_f.read())
+                except Exception:
+                    self.send_json({'success': False, 'error': 'Current password is incorrect.'}, status=403)
+                    return
+
+                self.send_json({'success': False, 'error': 'Please migrate vault to v2 format before changing password.'}, status=400)
+            return
+
+        if parsed.path == '/api/admin/migrate_vault':
+            if not ACTIVE_FERNET:
+                self.send_json({'success': False, 'error': 'No legacy vault to migrate (already v2 or vault locked).'}, status=400)
+                return
+
+            try:
+                # Step 1: Generate new DEK and KEK
+                length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(length).decode('utf-8') if length > 0 else ""
+                params = urllib.parse.parse_qs(body)
+                password = params.get('password', [''])[0]
+
+                if not password:
+                    self.send_json({'success': False, 'error': 'Password required for migration.'}, status=400)
+                    return
+
+                new_salt = secrets.token_bytes(KEK_SALT_SIZE)
+                dek = generate_dek()
+                kek = derive_kek(password, new_salt)
+                wrapped = wrap_dek(dek, kek)
+
+                # Step 2: Re-encrypt all media files
+                migrated_count = 0
+                total_files = len([f for f in DECRYPTED_INDEX if not f['name'].startswith('.')])
+
+                for item in DECRYPTED_INDEX:
+                    if item['name'].startswith('.'):
+                        continue
+                    enc_fpath = os.path.join(DATA_DIR, item['enc_id'])
+                    if os.path.exists(enc_fpath):
+                        with open(enc_fpath, 'rb') as ef:
+                            old_ciphertext = ef.read()
+                        plaintext = ACTIVE_FERNET.decrypt(old_ciphertext)
+                        new_ciphertext = vault_encrypt(plaintext, dek)
+                        with open(enc_fpath, 'wb') as ef:
+                            ef.write(new_ciphertext)
+                        migrated_count += 1
+
+                    # Also re-encrypt thumbnails
+                    if item.get('enc_thumb_id'):
+                        thumb_fpath = os.path.join(DATA_DIR, item['enc_thumb_id'])
+                        if os.path.exists(thumb_fpath):
+                            with open(thumb_fpath, 'rb') as tf:
+                                old_thumb_ct = tf.read()
+                            thumb_pt = ACTIVE_FERNET.decrypt(old_thumb_ct)
+                            new_thumb_ct = vault_encrypt(thumb_pt, dek)
+                            with open(thumb_fpath, 'wb') as tf:
+                                tf.write(new_thumb_ct)
+
+                # Step 3: Re-encrypt index
+                index_bytes = json.dumps(DECRYPTED_INDEX, indent=2).encode('utf-8')
+                new_index_ct = vault_encrypt(index_bytes, dek)
+                with open(INDEX_PATH, 'wb') as idx_f:
+                    idx_f.write(new_index_ct)
+
+                # Step 4: Save new salt and wrapped DEK
+                with open(SALT_PATH, 'wb') as sf:
+                    sf.write(new_salt)
+                with open(DEK_PATH, 'wb') as df:
+                    df.write(wrapped)
+
+                # Step 5: Switch active keys
+                ACTIVE_DEK = dek
+                ACTIVE_FERNET = None
+
+                self.send_json({
+                    'success': True,
+                    'message': f'Vault migrated to AES-256-GCM! {migrated_count} files re-encrypted.',
+                    'migrated_count': migrated_count
+                })
+
+            except Exception as e:
+                self.send_json({'success': False, 'error': f'Migration failed: {e}'}, status=500)
             return
 
         if parsed.path == '/api/admin/export_vault':
@@ -1230,14 +1553,14 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
             os.makedirs(export_dir, exist_ok=True)
 
             exported_count = 0
-            if ACTIVE_FERNET and DECRYPTED_INDEX:
+            if (ACTIVE_DEK or ACTIVE_FERNET) and DECRYPTED_INDEX:
                 for item in DECRYPTED_INDEX:
                     if item['name'].startswith('.'): continue
                     enc_fpath = os.path.join(DATA_DIR, item['enc_id'])
                     if os.path.exists(enc_fpath):
                         try:
                             with open(enc_fpath, 'rb') as ef: ciphertext = ef.read()
-                            plaintext = ACTIVE_FERNET.decrypt(ciphertext)
+                            plaintext = vault_decrypt(ciphertext, ACTIVE_DEK, fernet_fallback=ACTIVE_FERNET) if ACTIVE_DEK else ACTIVE_FERNET.decrypt(ciphertext)
 
                             sub_dir = os.path.join(export_dir, item['subfolder']) if item['subfolder'] else export_dir
                             os.makedirs(sub_dir, exist_ok=True)
@@ -1270,13 +1593,18 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
 
         if parsed.path == '/api/vault_status':
             is_init = is_valid_vault(VAULT_FOLDER)
+            is_leg = (ACTIVE_FERNET is not None and ACTIVE_DEK is None)
             self.send_json({
                 'initialized': is_init,
-                'allow_downloads': ALLOW_DOWNLOADS
+                'allow_downloads': ALLOW_DOWNLOADS,
+                'is_legacy': is_leg
             })
             return
 
         if not self.check_auth():
+            if parsed.path.startswith('/api/'):
+                self.send_json({'error': 'Unauthorized'}, status=401)
+                return
             self.send_response(302)
             self.send_header('Location', '/login')
             self.end_headers()
@@ -1352,7 +1680,7 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
 
         # Cryptographic SHA-256 Hash Duplicate Scanner
         if parsed.path == '/api/admin/duplicates':
-            if not ACTIVE_FERNET:
+            if not ACTIVE_DEK and not ACTIVE_FERNET:
                 self.send_json({'success': False, 'error': 'Vault locked'}, status=401)
                 return
 
@@ -1366,7 +1694,7 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
                 if os.path.exists(enc_fpath):
                     try:
                         with open(enc_fpath, 'rb') as ef: ciphertext = ef.read()
-                        plaintext = ACTIVE_FERNET.decrypt(ciphertext)
+                        plaintext = vault_decrypt(ciphertext, ACTIVE_DEK, fernet_fallback=ACTIVE_FERNET) if ACTIVE_DEK else ACTIVE_FERNET.decrypt(ciphertext)
                         chash = hashlib.sha256(plaintext).hexdigest()
                         hash_map[chash].append({
                             'enc_id': item['enc_id'],
@@ -1441,7 +1769,8 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
                 'potential_duplicates': duplicates_count,
                 'free_disk_gb': f"{free_disk / (1024*1024*1024):.2f} GB",
                 'gdrive_available': gdrive_found,
-                'enable_remote_shutdown': ENABLE_REMOTE_SHUTDOWN
+                'enable_remote_shutdown': ENABLE_REMOTE_SHUTDOWN,
+                'is_legacy': (ACTIVE_FERNET is not None and ACTIVE_DEK is None)
             })
             return
 
@@ -1453,19 +1782,23 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
             
             if item and item.get('enc_thumb_id'):
                 enc_thumb_path = os.path.join(DATA_DIR, item['enc_thumb_id'])
-                if os.path.exists(enc_thumb_path) and ACTIVE_FERNET:
+                if os.path.exists(enc_thumb_path) and (ACTIVE_DEK or ACTIVE_FERNET):
                     try:
                         with open(enc_thumb_path, 'rb') as ef: ciphertext = ef.read()
-                        thumb_bytes = ACTIVE_FERNET.decrypt(ciphertext)
+                        thumb_bytes = vault_decrypt(ciphertext, ACTIVE_DEK, fernet_fallback=ACTIVE_FERNET) if ACTIVE_DEK else ACTIVE_FERNET.decrypt(ciphertext)
                         self.send_bytes(thumb_bytes, 'image/jpeg')
                         return
                     except Exception: pass
 
-            enc_file_path = os.path.join(DATA_DIR, enc_id)
-            if os.path.exists(enc_file_path) and ACTIVE_FERNET:
+            try:
+                enc_file_path = safe_vault_path(enc_id)
+            except ValueError:
+                self.send_json({'error': 'Invalid path'}, status=404)
+                return
+            if os.path.exists(enc_file_path) and (ACTIVE_DEK or ACTIVE_FERNET):
                 try:
                     with open(enc_file_path, 'rb') as ef: ciphertext = ef.read()
-                    plaintext = ACTIVE_FERNET.decrypt(ciphertext)
+                    plaintext = vault_decrypt(ciphertext, ACTIVE_DEK, fernet_fallback=ACTIVE_FERNET) if ACTIVE_DEK else ACTIVE_FERNET.decrypt(ciphertext)
                     
                     with Image.open(io.BytesIO(plaintext)) as img:
                         img.thumbnail((200, 200))
@@ -1476,7 +1809,7 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
 
                         enc_thumb_id = f"enc_t_{secrets.token_hex(8)}.enc"
                         enc_thumb_fpath = os.path.join(DATA_DIR, enc_thumb_id)
-                        enc_thumb_bytes = ACTIVE_FERNET.encrypt(thumb_bytes)
+                        enc_thumb_bytes = vault_encrypt(thumb_bytes, ACTIVE_DEK) if ACTIVE_DEK else ACTIVE_FERNET.encrypt(thumb_bytes)
                         with open(enc_thumb_fpath, 'wb') as tf:
                             tf.write(enc_thumb_bytes)
 
@@ -1492,12 +1825,16 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith('/media/'):
             enc_id = urllib.parse.unquote(parsed.path[7:])
             if '?' in enc_id: enc_id = enc_id.split('?')[0]
-            enc_file_path = os.path.join(DATA_DIR, enc_id)
+            try:
+                enc_file_path = safe_vault_path(enc_id)
+            except ValueError:
+                self.send_json({'error': 'Invalid path'}, status=404)
+                return
 
-            if os.path.exists(enc_file_path) and ACTIVE_FERNET:
+            if os.path.exists(enc_file_path) and (ACTIVE_DEK or ACTIVE_FERNET):
                 try:
                     with open(enc_file_path, 'rb') as ef: ciphertext = ef.read()
-                    plaintext = ACTIVE_FERNET.decrypt(ciphertext)
+                    plaintext = vault_decrypt(ciphertext, ACTIVE_DEK, fernet_fallback=ACTIVE_FERNET) if ACTIVE_DEK else ACTIVE_FERNET.decrypt(ciphertext)
 
                     item = next((x for x in DECRYPTED_INDEX if x['enc_id'] == enc_id), None)
                     is_video = item['is_video'] if item else False
@@ -1548,12 +1885,16 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
                 return
             enc_id = urllib.parse.unquote(parsed.path[10:])
             if '?' in enc_id: enc_id = enc_id.split('?')[0]
-            enc_file_path = os.path.join(DATA_DIR, enc_id)
+            try:
+                enc_file_path = safe_vault_path(enc_id)
+            except ValueError:
+                self.send_json({'error': 'Invalid path'}, status=404)
+                return
 
-            if os.path.exists(enc_file_path) and ACTIVE_FERNET:
+            if os.path.exists(enc_file_path) and (ACTIVE_DEK or ACTIVE_FERNET):
                 try:
                     with open(enc_file_path, 'rb') as ef: ciphertext = ef.read()
-                    plaintext = ACTIVE_FERNET.decrypt(ciphertext)
+                    plaintext = vault_decrypt(ciphertext, ACTIVE_DEK, fernet_fallback=ACTIVE_FERNET) if ACTIVE_DEK else ACTIVE_FERNET.decrypt(ciphertext)
 
                     item = next((x for x in DECRYPTED_INDEX if x['enc_id'] == enc_id), None)
                     filename = item['name'] if item else 'download'
@@ -1638,9 +1979,11 @@ HTML_LOGIN = """<!DOCTYPE html>
         <h2 id="cardTitle">Sign In</h2>
         <p class="sub" id="cardSub">Enter passcode to unlock vault</p>
         
-        <input type="password" id="pwd" placeholder="Passcode" autofocus>
-        <input type="password" id="pwd_confirm" placeholder="Confirm Passcode" style="display: none;">
-        <button id="submitBtn" onclick="login()">Unlock Vault</button>
+        <form id="loginForm" method="POST" action="/login" onsubmit="return handleFormSubmit(event)">
+            <input type="password" id="pwd" name="password" placeholder="Passcode" autofocus>
+            <input type="password" id="pwd_confirm" placeholder="Confirm Passcode" style="display: none;">
+            <button type="submit" id="submitBtn">Unlock Vault</button>
+        </form>
         <div id="err" class="err"></div>
     </div>
     <script>
@@ -1670,50 +2013,40 @@ HTML_LOGIN = """<!DOCTYPE html>
             }
         }
 
-        async function login() {
+        async function handleFormSubmit(e) {
             const pwd = document.getElementById('pwd').value;
             const errEl = document.getElementById('err');
             errEl.innerText = '';
 
             if (!pwd) {
+                if(e) e.preventDefault();
                 errEl.innerText = 'Please enter a passcode.';
-                return;
+                return false;
             }
 
             if (!isInitialized) {
                 const confirmPwd = document.getElementById('pwd_confirm').value;
                 if (pwd.length < 4) {
+                    if(e) e.preventDefault();
                     errEl.innerText = 'Passcode must be at least 4 characters long.';
-                    return;
+                    return false;
                 }
                 if (pwd !== confirmPwd) {
+                    if(e) e.preventDefault();
                     errEl.innerText = 'Passcodes do not match! Please re-check.';
-                    return;
+                    return false;
                 }
             }
-
-            const res = await fetch('/login', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: 'password=' + encodeURIComponent(pwd)
-            });
-            const data = await res.json();
-            if (data.success) { 
-                if (data.token) sessionStorage.setItem('vault_token', data.token);
-                window.location.href = '/';
-            } else { 
-                errEl.innerText = data.error || 'Access denied'; 
-            }
+            return true;
         }
 
         document.getElementById('pwd').addEventListener('keypress', (e) => { 
             if (e.key === 'Enter') {
-                if (!isInitialized) document.getElementById('pwd_confirm').focus();
-                else login();
+                if (!isInitialized) {
+                    e.preventDefault();
+                    document.getElementById('pwd_confirm').focus();
+                }
             }
-        });
-        document.getElementById('pwd_confirm').addEventListener('keypress', (e) => { 
-            if (e.key === 'Enter') login(); 
         });
 
         checkStatus();
@@ -1954,7 +2287,6 @@ HTML_GALLERY = """<!DOCTYPE html>
             user-select: none !important;
             -webkit-user-drag: none !important;
             user-drag: none !important;
-            pointer-events: none !important;
         }
         .no-save .thumb, .no-save #grid {
             -webkit-touch-callout: none !important;
@@ -1965,7 +2297,7 @@ HTML_GALLERY = """<!DOCTYPE html>
             body { display: none !important; }
         }
 
-        /* DRM Hidden Screen Overlay with Eyeball Icon & Grace Click */
+        /* DRM Hidden Screen Overlay with Eyeball Icon */
         .drm-hidden-overlay {
             display: none;
             position: fixed;
@@ -2012,11 +2344,12 @@ HTML_GALLERY = """<!DOCTYPE html>
     </style>
 </head>
 <body>
-    <div id="drm-hidden-overlay" class="drm-hidden-overlay" onmousedown="handleGraceClick(event)" onclick="handleGraceClick(event)" ontouchstart="handleGraceClick(event)">
+    <div id="drm-hidden-overlay" class="drm-hidden-overlay" onclick="hideDrmHiddenScreen()">
         <div class="drm-eye-icon">👁️</div>
-        <div class="drm-hidden-text">Hidden</div>
+        <div class="drm-hidden-text">Protection Active</div>
         <div class="drm-tap-notice">Tap anywhere to resume viewing</div>
     </div>
+    <div id="legacy-banner" style="display:none; background:#d97706; color:#ffffff; text-align:center; padding:0.6rem 1rem; font-weight:600; font-size:0.9rem; cursor:pointer;" onclick="openAdminModal(); migrateVaultPrompt();">⚠️ Legacy Encryption Format (Fernet) — Click here to upgrade your vault to AES-256-GCM</div>
     <header>
         <div class="top-row">
             <div class="title-group">
@@ -2195,6 +2528,7 @@ HTML_GALLERY = """<!DOCTYPE html>
 
             <button style="background:#0284c7; color:#fff;" onclick="triggerCloudBackup()">☁️ Backup Encrypted Vault to Google Drive</button>
             <button style="background:#8b5cf6; color:#fff; margin-top:0.6rem;" onclick="openFolderManagerModal()">📁 Open Full Folder Manager</button>
+            <button id="admin-migrate-btn" style="background:#f59e0b; color:#fff; margin-top:0.6rem; display:none;" onclick="migrateVaultPrompt()">⚡ Upgrade Vault Encryption (AES-256-GCM + Argon2id)</button>
             <button style="background:#6366f1; color:#fff; margin-top:0.6rem;" onclick="changePasswordPrompt()">🔑 Change Password</button>
             <button style="background:#0284c7; color:#fff; margin-top:0.6rem;" onclick="exportVaultPrompt()">🔓 Decrypt All Files to PC</button>
             <button id="admin-shutdown-btn" style="background:#dc2626; color:#fff; margin-top:0.6rem; display:none;" onclick="shutdownPC()">🔴 Shut Down PC</button>
@@ -2229,28 +2563,17 @@ HTML_GALLERY = """<!DOCTYPE html>
         
         const preloadedCache = {};
 
-        function getTokenParam() {
-            const urlParams = new URLSearchParams(window.location.search);
-            let token = urlParams.get('token');
-            if(!token) token = sessionStorage.getItem('vault_token') || localStorage.getItem('vault_token');
-            return token ? '?token=' + encodeURIComponent(token) : '';
-        }
-
         async function authFetch(url, options = {}) {
             options.headers = options.headers || {};
-            const urlParams = new URLSearchParams(window.location.search);
-            let token = urlParams.get('token');
-            if(!token) token = sessionStorage.getItem('vault_token');
-            
-            if (token) {
-                options.headers['X-Auth-Token'] = token;
+            const csrfToken = document.cookie.split('; ').find(c => c.startsWith('csrf_token='));
+            if (csrfToken) {
+                options.headers['X-CSRF-Token'] = csrfToken.split('=')[1];
             }
             options.credentials = 'same-origin';
-            
+
             try {
                 const res = await fetch(url, options);
                 if (res && res.status === 401) {
-                    sessionStorage.removeItem('vault_token');
                     window.location.href = '/login';
                     return null;
                 }
@@ -2293,8 +2616,6 @@ HTML_GALLERY = """<!DOCTYPE html>
             }
         }
 
-        let graceClickCooldown = 0;
-
         function showDrmHiddenScreen() {
             if (allowDownloads) return;
             const overlay = document.getElementById('drm-hidden-overlay');
@@ -2304,28 +2625,18 @@ HTML_GALLERY = """<!DOCTYPE html>
         function hideDrmHiddenScreen() {
             const overlay = document.getElementById('drm-hidden-overlay');
             if (overlay) overlay.classList.remove('active');
-
-            const gridEl = document.getElementById('grid');
-            const vBody = document.getElementById('v-body');
-            if (gridEl) {
-                gridEl.style.filter = 'none';
-                gridEl.style.opacity = '1';
-            }
-            if (vBody) {
-                vBody.style.filter = 'none';
-                vBody.style.opacity = '1';
-            }
         }
 
-        function handleGraceClick(e) {
-            if (e) {
-                if (e.preventDefault) e.preventDefault();
-                if (e.stopPropagation) e.stopPropagation();
+        document.addEventListener('keydown', (e) => {
+            if (!allowDownloads) {
+                if (e.key === 'PrintScreen' || e.code === 'PrintScreen') {
+                    e.preventDefault();
+                    showDrmHiddenScreen();
+                    setTimeout(() => { hideDrmHiddenScreen(); }, 1500);
+                    return false;
+                }
             }
-            graceClickCooldown = Date.now() + 450;
-            hideDrmHiddenScreen();
-            return false;
-        }
+        });
 
         // Anti-Save & Anti-Screenshot Event Interceptors for Grid & Lightbox
         document.addEventListener('contextmenu', (e) => {
@@ -2342,44 +2653,9 @@ HTML_GALLERY = """<!DOCTYPE html>
             }
         }, { capture: true });
 
-        // Screenshot Key Interception (PrintScreen, Ctrl+P, Ctrl+S, Cmd+Shift+3/4/5)
-        document.addEventListener('keydown', (e) => {
-            if (!allowDownloads) {
-                if (e.key === 'PrintScreen' || e.code === 'PrintScreen' || 
-                    (e.ctrlKey && (e.key === 'p' || e.key === 's')) ||
-                    (e.metaKey && (e.key === 'p' || e.key === 's'))) {
-                    e.preventDefault();
-                    showDrmHiddenScreen();
-                    setTimeout(() => { hideDrmHiddenScreen(); }, 1500);
-                    return false;
-                }
-            }
-        });
-
-        document.addEventListener('keyup', (e) => {
-            if (!allowDownloads && (e.key === 'PrintScreen' || e.code === 'PrintScreen')) {
-                if (navigator.clipboard && navigator.clipboard.writeText) {
-                    navigator.clipboard.writeText('');
-                }
-                showDrmHiddenScreen();
-                setTimeout(() => { hideDrmHiddenScreen(); }, 1500);
-            }
-        });
-
-        // Window Focus/Blur for Desktop Hidden Screen Overlay
-        window.addEventListener('blur', () => {
-            if (!allowDownloads) showDrmHiddenScreen();
-        });
-
-        window.addEventListener('focus', () => {
-            if (!allowDownloads) {
-                graceClickCooldown = Date.now() + 450;
-                hideDrmHiddenScreen();
-            }
-        });
-
         async function init() {
             checkVaultConfig().catch(e => console.error("checkVaultConfig error:", e));
+            checkLegacyStatus().catch(e => console.error("checkLegacyStatus error:", e));
             loadFiles('__ALL__').catch(e => console.error("loadFiles error:", e));
             loadFolders().catch(e => console.error("loadFolders error:", e));
         }
@@ -2613,8 +2889,6 @@ HTML_GALLERY = """<!DOCTYPE html>
                 return;
             }
 
-            const tokenParam = getTokenParam();
-
             const batchSize = 60;
             let currentOffset = 0;
 
@@ -2641,7 +2915,7 @@ HTML_GALLERY = """<!DOCTYPE html>
                     let cbChecked = selectedEncIds.has(f.enc_id) ? 'checked' : '';
                     let cbHtml = `<input type="checkbox" class="thumb-checkbox" ${cbChecked} onclick="toggleFileSelection('${f.enc_id}', event)">`;
                     
-                    const thumbUrl = '/thumb/' + encodeURIComponent(f.enc_id) + tokenParam;
+                    const thumbUrl = '/thumb/' + encodeURIComponent(f.enc_id);
                     if(f.is_live_photo) {
                         div.innerHTML = `${starHtml}<img src="${thumbUrl}" loading="lazy"><div class="live-icon">📸 LIVE</div>${cbHtml}`;
                     } else if(f.is_video) {
@@ -2686,6 +2960,14 @@ HTML_GALLERY = """<!DOCTYPE html>
                     if (shutdownBtn) {
                         shutdownBtn.style.display = stats.enable_remote_shutdown ? 'block' : 'none';
                     }
+                    const migrateBtn = document.getElementById('admin-migrate-btn');
+                    if (migrateBtn) {
+                        migrateBtn.style.display = stats.is_legacy ? 'block' : 'none';
+                    }
+                    const legacyBanner = document.getElementById('legacy-banner');
+                    if (legacyBanner) {
+                        legacyBanner.style.display = stats.is_legacy ? 'block' : 'none';
+                    }
                     if (stats.allow_downloads !== undefined) {
                         allowDownloads = !!stats.allow_downloads;
                         applyDrmProtections();
@@ -2709,15 +2991,13 @@ HTML_GALLERY = """<!DOCTYPE html>
             listDiv.innerHTML = '';
             selectedDupIds.clear();
 
-            const tokenParam = getTokenParam();
-
             duplicateData.duplicate_groups.forEach((g, gIdx) => {
                 const groupDiv = document.createElement('div');
                 groupDiv.className = 'dup-group';
                 
                 let cardsHtml = '';
                 g.items.forEach((it, iIdx) => {
-                    const thumbUrl = '/thumb/' + encodeURIComponent(it.enc_id) + tokenParam;
+                    const thumbUrl = '/thumb/' + encodeURIComponent(it.enc_id);
                     cardsHtml += `
                         <div class="dup-item-card">
                             <input type="checkbox" class="dup-item-cb" id="dup-cb-${it.enc_id}" onchange="toggleDupSelection('${it.enc_id}')">
@@ -2989,12 +3269,14 @@ HTML_GALLERY = """<!DOCTYPE html>
         }
 
         async function changePasswordPrompt() {
-            const newPwd = prompt("Enter new password:");
+            const oldPwd = prompt("Enter current master password:");
+            if(!oldPwd) return;
+            const newPwd = prompt("Enter new master password (min 8 characters):");
             if(newPwd) {
                 const res = await authFetch('/api/admin/change_password', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                    body: 'new_password=' + encodeURIComponent(newPwd)
+                    body: 'old_password=' + encodeURIComponent(oldPwd) + '&new_password=' + encodeURIComponent(newPwd)
                 });
                 if(!res) return;
                 const data = await res.json();
@@ -3011,9 +3293,46 @@ HTML_GALLERY = """<!DOCTYPE html>
             }
         }
 
+        async function checkLegacyStatus() {
+            try {
+                const res = await authFetch('/api/admin/stats');
+                if(!res) return;
+                const stats = await res.json();
+                if(stats && stats.is_legacy) {
+                    const banner = document.getElementById('legacy-banner');
+                    if(banner) banner.style.display = 'block';
+                    const btn = document.getElementById('admin-migrate-btn');
+                    if(btn) btn.style.display = 'block';
+                }
+            } catch(e) {}
+        }
+
+        async function migrateVaultPrompt() {
+            if (!confirm("Upgrade vault encryption to AES-256-GCM + Argon2id?\\n\\nThis will re-encrypt all media files with NIST-compliant AES-256-GCM and enable instant master password changes. Make sure server power is uninterrupted during migration.")) {
+                return;
+            }
+            const pwd = prompt("Enter master password to authorize migration:");
+            if (!pwd) return;
+
+            alert("⏳ Migration started... Please wait while your files are being re-encrypted.");
+
+            const res = await authFetch('/api/admin/migrate_vault', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: 'password=' + encodeURIComponent(pwd)
+            });
+            if (!res) return;
+            const data = await res.json();
+            if (data.success) {
+                alert("✅ " + (data.message || "Vault migrated successfully!"));
+                location.reload();
+            } else {
+                alert("❌ Migration failed: " + (data.error || "Unknown error"));
+            }
+        }
+
         async function lockVaultNow() {
             await authFetch('/logout', { method: 'POST' });
-            sessionStorage.removeItem('vault_token');
             window.location.href = '/login';
         }
 
@@ -3033,8 +3352,7 @@ HTML_GALLERY = """<!DOCTYPE html>
         function preloadMediaUrl(enc_id, isVideo) {
             if (!enc_id || isVideo || preloadedCache[enc_id]) return;
             const img = new Image();
-            const tokenParam = getTokenParam();
-            img.src = '/media/' + encodeURIComponent(enc_id) + tokenParam;
+            img.src = '/media/' + encodeURIComponent(enc_id);
             preloadedCache[enc_id] = img;
         }
 
@@ -3062,9 +3380,8 @@ HTML_GALLERY = """<!DOCTYPE html>
             
             const body = document.getElementById('v-body');
             if(!body) return;
-            const tokenParam = getTokenParam();
-            const thumbUrl = '/thumb/' + encodeURIComponent(f.enc_id) + tokenParam;
-            const mediaUrl = '/media/' + encodeURIComponent(f.enc_id) + tokenParam;
+            const thumbUrl = '/thumb/' + encodeURIComponent(f.enc_id);
+            const mediaUrl = '/media/' + encodeURIComponent(f.enc_id);
             
             if(f.is_live_photo) {
                 body.innerHTML = `
@@ -3159,8 +3476,7 @@ HTML_GALLERY = """<!DOCTYPE html>
             const f = files[currentIndex];
             if (!f || !f.enc_id) return;
 
-            const tokenParam = getTokenParam();
-            const downloadUrl = '/download/' + encodeURIComponent(f.enc_id) + tokenParam;
+            const downloadUrl = '/download/' + encodeURIComponent(f.enc_id);
 
             const a = document.createElement('a');
             a.href = downloadUrl;
@@ -3312,8 +3628,12 @@ def create_tray_icon_image():
 RESTART_REQUESTED = False
 
 
+def open_vault_browser():
+    target_port = HTTPS_PORT if HTTPS_PORT else PORT
+    webbrowser.open(f"https://127.0.0.1:{target_port}")
+
 def on_open_browser(icon, item):
-    webbrowser.open(f"http://127.0.0.1:{PORT}")
+    open_vault_browser()
 
 
 def on_cloud_backup_action(icon, item):
@@ -3367,20 +3687,41 @@ class ThreadedHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
 
+class HTTPRedirectHandler(BaseHTTPRequestHandler):
+    """HTTP handler that redirects all requests to HTTPS."""
+
+    def log_message(self, format, *args):
+        if sys.stderr is not None and hasattr(sys.stderr, 'write'):
+            try:
+                sys.stderr.write("%s - - [%s] %s\n" % (self.client_address[0], self.log_date_time_string(), format % args))
+            except Exception:
+                pass
+
+    def do_GET(self):
+        host = self.headers.get('Host', f'{LOCAL_IP}:{HTTPS_PORT}').split(':')[0]
+        target = f"https://{host}:{HTTPS_PORT}{self.path}"
+        self.send_response(307)
+        self.send_header('Location', target)
+        self.end_headers()
+
+    def do_POST(self):
+        self.do_GET()
+
+
 def bind_http_server(start_port):
-    """Bind HTTP listeners across both 127.0.0.1 (for local firewall bypass) and LOCAL_IP (for LAN/mobile access)."""
+    """Bind HTTP listeners across both 127.0.0.1 and LOCAL_IP that redirect to HTTPS."""
     servers = []
     actual_port = None
 
     for p in range(start_port, start_port + 20):
         try:
-            s1 = ThreadedHTTPServer(('127.0.0.1', p), VaultGalleryHandler)
+            s1 = ThreadedHTTPServer(('127.0.0.1', p), HTTPRedirectHandler)
             servers.append(s1)
             actual_port = p
 
             if LOCAL_IP and LOCAL_IP not in ('127.0.0.1', '0.0.0.0'):
                 try:
-                    s2 = ThreadedHTTPServer((LOCAL_IP, p), VaultGalleryHandler)
+                    s2 = ThreadedHTTPServer((LOCAL_IP, p), HTTPRedirectHandler)
                     servers.append(s2)
                 except Exception as e:
                     print(f"LAN Listener Notice for {LOCAL_IP}:{p}: {e}")
@@ -3403,6 +3744,7 @@ def bind_https_server(start_port):
     for p in range(start_port, start_port + 20):
         try:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             ctx.load_cert_chain(certfile=CERT_PATH, keyfile=KEY_PATH)
 
             s1 = ThreadedHTTPServer(('127.0.0.1', p), VaultGalleryHandler)
@@ -3413,6 +3755,7 @@ def bind_https_server(start_port):
             if LOCAL_IP and LOCAL_IP not in ('127.0.0.1', '0.0.0.0'):
                 try:
                     ctx2 = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                    ctx2.minimum_version = ssl.TLSVersion.TLSv1_2
                     ctx2.load_cert_chain(certfile=CERT_PATH, keyfile=KEY_PATH)
                     s2 = ThreadedHTTPServer((LOCAL_IP, p), VaultGalleryHandler)
                     s2.socket = ctx2.wrap_socket(s2.socket, server_side=True)
@@ -3525,10 +3868,10 @@ def run_vault_cycle(selected_vault_dir=None):
     print(f"  Remote Shutdown: {'ENABLED' if ENABLE_REMOTE_SHUTDOWN else 'disabled'}")
     print(f"=======================================================================")
 
-    # Automatically open default browser to the bound HTTP port
+    # Automatically open default browser to the bound HTTP/HTTPS port
     def auto_open_browser():
         time.sleep(0.5)
-        webbrowser.open(f"http://127.0.0.1:{PORT}")
+        open_vault_browser()
 
     threading.Thread(target=auto_open_browser, daemon=True).start()
 
