@@ -15,7 +15,6 @@ CryptHaven is a self-hosted media vault server that keeps your personal photos a
 ## ✨ Features
 
 - **🗃️ Multi-Vault Launcher UI**: Select, open, or transform any directory into a media vault from a single Windows GUI launcher.
-- **🧹 Stable Recent Vaults**: Packaged builds store only user-selected vault paths and automatically remove stale PyInstaller `_MEI...` extraction entries created by older versions.
 - **🔒 Encrypted at Rest**: All media is encrypted using AES-256-GCM with Argon2id key derivation and a DEK/KEK key architecture. The running server necessarily holds the active key while a vault is unlocked.
 - **📱 Responsive Local Web Gallery**: Full-screen media viewer with pinch-to-zoom, touch navigation, auto-fading controls, and side-tap zone navigation.
 - **🛡️ Configurable DRM & Download Controls**: Toggle media downloading and saving permissions per vault session directly from the launcher.
