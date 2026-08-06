@@ -21,7 +21,11 @@ CryptHaven v0.3.0+ uses the following cryptographic primitives:
 
 Legacy v0.1.x vaults using Fernet (AES-128-CBC + HMAC-SHA256) and v0.2.x vaults using AES-GCM without context binding remain readable. Both can be migrated to v3 through the authenticated admin workflow.
 
-The migration performs a strict preflight before changing live data. Every indexed media and thumbnail ciphertext must exist, every file in the encrypted data directory must have a known index context, and duplicate identifiers may not cross media/thumbnail contexts. CryptHaven then stages and authenticates every v3 replacement before a journaled directory/index/envelope commit. Pre-commit interruptions roll back; post-commit recovery removes obsolete v1/v2 key files and temporary backups. This design intentionally fails closed when ciphertext cannot be migrated unambiguously.
+The migration performs a strict preflight before changing live data. Every indexed media and thumbnail ciphertext must exist, every file in the encrypted data directory must have a known index context, and duplicate identifiers may not cross media/thumbnail contexts. Internal folder-placeholder records intentionally have no payload and are excluded. CryptHaven then stages and authenticates every v3 replacement before a journaled directory/index/envelope commit. Pre-commit interruptions roll back; post-commit recovery removes obsolete v1/v2 key files and temporary backups. This design intentionally fails closed when ciphertext cannot be migrated unambiguously.
+
+v0.3.1 adds an authenticated integrity scanner and narrowly scoped repair workflow. It never invents missing media content: thumbnail references may be cleared for regeneration, missing media records require explicit confirmation, and unindexed ciphertext is quarantined rather than deleted. Each repair preserves the encrypted pre-repair index and a manifest in `vault_recovery`.
+
+LAN listeners are restricted to loopback and detected RFC1918 addresses. CGNAT and tunnel ranges such as Cloudflare WARP's `100.64.0.0/10` are not treated as trusted LAN addresses. CryptHaven regenerates its self-signed certificate when the certificate/key pair is invalid, near expiry, mismatched, or missing an active LAN address from its subject-alternative names.
 
 Users should still keep an independent, offline or otherwise separately protected backup before migration. Transactional recovery protects against application interruption; it does not replace disaster recovery for disk failure, filesystem corruption, malware, or operator deletion.
 

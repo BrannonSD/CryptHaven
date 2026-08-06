@@ -9,6 +9,7 @@ import http.client
 import os
 import secrets
 import shutil
+import socket
 import ssl
 import tempfile
 import threading
@@ -98,6 +99,72 @@ class TemporaryVaultTestCase(unittest.TestCase):
         success, message = cs.load_vault(PASSWORD)
         self.assertTrue(success, message)
         return item, plaintext, thumbnail, dek
+
+
+class NetworkDiscoveryTests(unittest.TestCase):
+    def test_lan_detection_excludes_warp_cgnat_and_keeps_wifi(self):
+        address_info = [
+            (socket.AF_INET, socket.SOCK_STREAM, 0, '', ('100.96.0.1', 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 0, '', ('10.0.0.47', 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 0, '', ('192.168.50.12', 0)),
+        ]
+        route_socket = mock.MagicMock()
+        route_socket.__enter__.return_value = route_socket
+        route_socket.getsockname.return_value = ('100.96.0.1', 49152)
+        with mock.patch.object(cs.socket, 'getaddrinfo', return_value=address_info), \
+             mock.patch.object(cs.socket, 'gethostname', return_value='test-host'), \
+             mock.patch.object(cs.socket, 'socket', return_value=route_socket):
+            self.assertEqual(cs.detect_lan_ips(), ['10.0.0.47', '192.168.50.12'])
+
+        self.assertFalse(cs.is_lan_ipv4('100.96.0.1'))
+        self.assertFalse(cs.is_lan_ipv4('169.254.2.4'))
+        self.assertTrue(cs.is_lan_ipv4('172.20.4.8'))
+
+    def test_http_binding_targets_loopback_and_every_lan_address(self):
+        created = []
+
+        class DummyServer:
+            def __init__(self, address, handler):
+                created.append(address)
+
+            def server_close(self):
+                pass
+
+        with mock.patch.object(cs, 'LAN_IPS', ['10.0.0.47', '192.168.50.12']), \
+             mock.patch.object(cs, 'ThreadedHTTPServer', DummyServer):
+            servers, port = cs.bind_http_server(18080)
+
+        self.assertEqual(port, 18080)
+        self.assertEqual(len(servers), 3)
+        self.assertEqual(
+            created,
+            [('127.0.0.1', 18080), ('10.0.0.47', 18080), ('192.168.50.12', 18080)],
+        )
+
+
+class TLSAddressCoverageTests(TemporaryVaultTestCase):
+    def test_generated_certificate_rotates_when_lan_addresses_change(self):
+        with mock.patch.object(cs, 'LAN_IPS', ['192.168.1.20']), \
+             mock.patch.object(cs, 'LOCAL_IP', '192.168.1.20'):
+            self.assertTrue(cs.generate_self_signed_ssl_certificate())
+            with open(cs.CERT_PATH, 'rb') as cert_file:
+                original_certificate = cert_file.read()
+
+        with mock.patch.object(cs, 'LAN_IPS', ['10.0.0.47']), \
+             mock.patch.object(cs, 'LOCAL_IP', '10.0.0.47'):
+            self.assertFalse(cs.tls_certificate_is_current())
+            self.assertTrue(cs.generate_self_signed_ssl_certificate())
+            self.assertTrue(cs.tls_certificate_is_current())
+            with open(cs.CERT_PATH, 'rb') as cert_file:
+                replacement_bytes = cert_file.read()
+            replacement = cs.x509.load_pem_x509_certificate(replacement_bytes)
+            san = replacement.extensions.get_extension_for_class(
+                cs.x509.SubjectAlternativeName
+            ).value
+            covered = {str(value) for value in san.get_values_for_type(cs.x509.IPAddress)}
+
+        self.assertNotEqual(original_certificate, replacement_bytes)
+        self.assertEqual(covered, {'127.0.0.1', '10.0.0.47'})
 
 
 class VaultHistoryTests(unittest.TestCase):
@@ -350,6 +417,28 @@ class MigrationTests(TemporaryVaultTestCase):
         cs.lock_vault()
         self.assertTrue(cs.load_vault(PASSWORD)[0])
 
+    def test_v2_migration_ignores_intentional_folder_placeholders(self):
+        self.create_v2_vault()
+        cs.DECRYPTED_INDEX.append({
+            "enc_id": "enc_folder_placeholder.enc",
+            "name": ".folder_placeholder",
+            "subfolder": "Hand Curated",
+            "rel_path": "Hand Curated/.folder_placeholder",
+            "size": 0,
+            "is_video": False,
+            "is_live_photo": False,
+            "mtime": time.time(),
+            "starred": False,
+            "enc_thumb_id": None,
+        })
+        cs.save_index()
+
+        report = cs.scan_vault_integrity()
+        self.assertEqual(report["placeholder_count"], 1)
+        self.assertEqual(report["missing_media"], [])
+        self.assertEqual(cs.migrate_vault_to_v3(PASSWORD), 1)
+        self.assertEqual(cs.active_vault_format_version(), 3)
+
     def test_v2_interruption_rolls_back_all_live_paths(self):
         item, _, _, _ = self.create_v2_vault()
         original_paths = (
@@ -421,6 +510,115 @@ class MigrationTests(TemporaryVaultTestCase):
         self.assertEqual(cs.active_vault_format_version(), 3)
         cs.lock_vault()
         self.assertTrue(cs.load_vault(NEW_PASSWORD)[0])
+
+
+class IntegrityRepairTests(TemporaryVaultTestCase):
+    def add_item(self, enc_id, name, *, thumb_id=None, media=None, thumbnail=None):
+        item = {
+            "enc_id": enc_id,
+            "name": name,
+            "subfolder": "",
+            "rel_path": name,
+            "size": len(media or b""),
+            "is_video": False,
+            "is_live_photo": False,
+            "mtime": time.time(),
+            "starred": False,
+            "enc_thumb_id": thumb_id,
+        }
+        cs.DECRYPTED_INDEX.append(item)
+        if media is not None:
+            cs.atomic_write(
+                cs.safe_vault_path(enc_id),
+                cs.vault_encrypt(media, cs.ACTIVE_DEK, context=f"media:{enc_id}"),
+            )
+        if thumb_id and thumbnail is not None:
+            cs.atomic_write(
+                cs.safe_vault_path(thumb_id),
+                cs.vault_encrypt(thumbnail, cs.ACTIVE_DEK, context=f"thumb:{thumb_id}"),
+            )
+        return item
+
+    def test_scan_classifies_discrepancies_without_touching_placeholders(self):
+        self.initialize()
+        self.add_item("enc_present.enc", "present.jpg", media=b"present")
+        self.add_item("enc_missing.enc", "missing.jpg")
+        self.add_item(
+            "enc_thumb_media.enc", "missing-thumb.jpg",
+            thumb_id="enc_missing_thumb.enc", media=b"thumbnail source",
+        )
+        cs.DECRYPTED_INDEX.append({
+            "enc_id": "enc_folder_no_payload.enc",
+            "name": ".folder_placeholder",
+            "subfolder": "Archive",
+            "rel_path": "Archive/.folder_placeholder",
+            "size": 0,
+        })
+        cs.atomic_write(cs.safe_vault_path("enc_orphan.enc"), b"opaque orphan")
+        cs.save_index()
+
+        report = cs.scan_vault_integrity()
+        self.assertEqual([x["enc_id"] for x in report["missing_media"]], ["enc_missing.enc"])
+        self.assertEqual(
+            [x["enc_thumb_id"] for x in report["missing_thumbnails"]],
+            ["enc_missing_thumb.enc"],
+        )
+        self.assertEqual(
+            [x["enc_id"] for x in report["unindexed_ciphertext"]],
+            ["enc_orphan.enc"],
+        )
+        self.assertEqual(report["placeholder_count"], 1)
+        self.assertTrue(report["migration_blocked"])
+
+    def test_missing_thumbnail_repair_is_backed_up_and_regenerable(self):
+        self.initialize()
+        item = self.add_item(
+            "enc_media.enc", "photo.jpg", thumb_id="enc_gone_thumb.enc", media=b"photo",
+        )
+        cs.save_index()
+
+        result = cs.repair_vault_integrity(
+            "clear_missing_thumbnails", ["enc_gone_thumb.enc"]
+        )
+
+        self.assertEqual(result["affected_count"], 1)
+        self.assertIsNone(item["enc_thumb_id"])
+        self.assertTrue(os.path.isfile(os.path.join(result["recovery_path"], "original-vault_index.json")))
+        with open(os.path.join(result["recovery_path"], "manifest.json"), encoding="utf-8") as manifest_file:
+            self.assertEqual(json.load(manifest_file)["status"], "completed")
+        self.assertTrue(result["report"]["healthy"])
+
+    def test_missing_media_removal_preserves_companion_thumbnail_in_recovery(self):
+        self.initialize()
+        item = self.add_item(
+            "enc_missing_media.enc", "lost.jpg",
+            thumb_id="enc_surviving_thumb.enc", thumbnail=b"surviving thumbnail",
+        )
+        cs.save_index()
+
+        result = cs.repair_vault_integrity("remove_missing_media", [item["enc_id"]])
+
+        self.assertNotIn(item, cs.DECRYPTED_INDEX)
+        self.assertFalse(os.path.exists(cs.safe_vault_path("enc_surviving_thumb.enc")))
+        preserved = os.path.join(
+            result["recovery_path"], "ciphertext", "enc_surviving_thumb.enc"
+        )
+        self.assertTrue(os.path.isfile(preserved))
+        self.assertTrue(result["report"]["healthy"])
+
+    def test_unindexed_ciphertext_is_quarantined_not_deleted(self):
+        self.initialize()
+        orphan_id = "enc_unindexed.enc"
+        original = b"unindexed ciphertext bytes"
+        cs.atomic_write(cs.safe_vault_path(orphan_id), original)
+
+        result = cs.repair_vault_integrity("quarantine_unindexed", [orphan_id])
+
+        self.assertFalse(os.path.exists(cs.safe_vault_path(orphan_id)))
+        quarantined = os.path.join(result["recovery_path"], "ciphertext", orphan_id)
+        with open(quarantined, "rb") as quarantine_file:
+            self.assertEqual(quarantine_file.read(), original)
+        self.assertTrue(result["report"]["healthy"])
 
 
 class InputAndSessionTests(TemporaryVaultTestCase):
@@ -520,6 +718,29 @@ class HTTPIntegrationTests(TemporaryVaultTestCase):
 
         status, _, _ = self.request('GET', '/api/folders', headers={'Cookie': cookie_header})
         self.assertEqual(status, 200)
+
+        status, _, payload = self.request(
+            'GET', '/api/admin/integrity', headers={'Cookie': cookie_header}
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(payload)["healthy"])
+
+        orphan_id = "enc_http_orphan.enc"
+        cs.atomic_write(cs.safe_vault_path(orphan_id), b"synthetic orphan")
+        repair_body = json.dumps({
+            "action": "quarantine_unindexed", "enc_ids": [orphan_id]
+        })
+        status, _, payload = self.request(
+            'POST', '/api/admin/integrity/repair', repair_body,
+            {
+                'Cookie': cookie_header,
+                'X-CSRF-Token': csrf_token,
+                'Content-Type': 'application/json',
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["affected_count"], 1)
+        self.assertFalse(os.path.exists(cs.safe_vault_path(orphan_id)))
 
         status, _, _ = self.request(
             'POST', '/api/admin/cloud_backup', headers={'Cookie': cookie_header}

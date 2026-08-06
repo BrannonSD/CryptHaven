@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='CryptHaven-v0.3.0-alpha',
+    name='CryptHaven-v0.3.1-alpha',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

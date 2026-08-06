@@ -45,7 +45,7 @@ if sys.stdout is not None and hasattr(sys.stdout, 'reconfigure'):
 # ---------------------------------------------------------------------------
 
 # ── Configuration ──────────────────────────────────────────────────────────
-VERSION = "v0.3.0-alpha"
+VERSION = "v0.3.1-alpha"
 PORT = int(os.environ.get('CRYPTHAVEN_PORT', 8080))
 HTTPS_PORT = int(os.environ.get('CRYPTHAVEN_HTTPS_PORT', 8443))
 ALLOW_DOWNLOADS = os.environ.get('CRYPTHAVEN_ALLOW_DOWNLOADS', 'false').lower() == 'true'
@@ -71,17 +71,48 @@ ARGON2_PARALLELISM = 4
 
 
 
-def detect_local_ip():
-    """Detect the primary LAN IP address of this machine."""
+RFC1918_NETWORKS = tuple(
+    ipaddress.ip_network(network) for network in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')
+)
+
+
+def is_lan_ipv4(value: str) -> bool:
+    """Accept private LAN IPv4 addresses while excluding VPN/CGNAT/link-local ranges."""
+    try:
+        address = ipaddress.ip_address(value)
+        return address.version == 4 and any(address in network for network in RFC1918_NETWORKS)
+    except ValueError:
+        return False
+
+
+def detect_lan_ips() -> list[str]:
+    """Discover stable RFC1918 addresses without preferring the default VPN route."""
+    candidates = set()
+    try:
+        for result in socket.getaddrinfo(
+            socket.gethostname(), None, socket.AF_INET, socket.SOCK_STREAM
+        ):
+            address = result[4][0]
+            if is_lan_ipv4(address):
+                candidates.add(address)
+    except OSError:
+        pass
+
+    # A route-derived address remains a useful fallback on hosts whose name is
+    # not registered locally, but only when it is a genuine RFC1918 address.
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(('8.8.8.8', 80))
-            return s.getsockname()[0]
-    except Exception:
-        return '127.0.0.1'
+            route_address = s.getsockname()[0]
+            if is_lan_ipv4(route_address):
+                candidates.add(route_address)
+    except OSError:
+        pass
+    return sorted(candidates, key=lambda value: int(ipaddress.ip_address(value)))
 
 
-LOCAL_IP = detect_local_ip()
+LAN_IPS = detect_lan_ips()
+LOCAL_IP = LAN_IPS[0] if LAN_IPS else '127.0.0.1'
 
 APP_MUTEX = None
 SINGLE_INSTANCE_SOCKET = None
@@ -666,10 +697,43 @@ MIGRATION_IN_PROGRESS = False
 TRAY_ICON = None
 SERVER_HTTPD = None
 SERVER_HTTPS = None
+SERVER_HTTP_LISTENERS = []
+SERVER_HTTPS_LISTENERS = []
+
+
+def tls_certificate_is_current() -> bool:
+    """Validate that the generated certificate/key cover every active LAN listener."""
+    if not (os.path.isfile(CERT_PATH) and os.path.isfile(KEY_PATH)):
+        return False
+    try:
+        with open(CERT_PATH, 'rb') as cert_file:
+            certificate = x509.load_pem_x509_certificate(cert_file.read())
+        with open(KEY_PATH, 'rb') as key_file:
+            private_key = serialization.load_pem_private_key(key_file.read(), password=None)
+        certificate_key = certificate.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        private_public_key = private_key.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        if not secrets.compare_digest(certificate_key, private_public_key):
+            return False
+        san = certificate.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        covered_ips = {str(value) for value in san.get_values_for_type(x509.IPAddress)}
+        required_ips = {'127.0.0.1', *LAN_IPS}
+        expires_at = getattr(certificate, 'not_valid_after_utc', None)
+        if expires_at is None:
+            expires_at = certificate.not_valid_after.replace(tzinfo=datetime.timezone.utc)
+        return required_ips <= covered_ips and expires_at > (
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
+        )
+    except (OSError, ValueError, TypeError, x509.ExtensionNotFound):
+        return False
+
 
 def generate_self_signed_ssl_certificate():
     """Auto-generate 2048-bit RSA Self-Signed TLS Certificate for 100% Encrypted Local HTTPS."""
-    if os.path.exists(CERT_PATH) and os.path.exists(KEY_PATH):
+    if tls_certificate_is_current():
         return True
 
     try:
@@ -696,7 +760,7 @@ def generate_self_signed_ssl_certificate():
             x509.SubjectAlternativeName([
                 x509.DNSName("localhost"),
                 x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
-                x509.IPAddress(ipaddress.ip_address(LOCAL_IP)),
+                *[x509.IPAddress(ipaddress.ip_address(address)) for address in LAN_IPS],
             ]),
             critical=False,
         ).sign(key, hashes.SHA256())
@@ -1218,6 +1282,229 @@ def commit_item_deletions(items: list) -> int:
         return len(items)
 
 
+def is_internal_placeholder(item: dict) -> bool:
+    """Return whether an index entry represents metadata rather than ciphertext."""
+    return str(item.get('name', '')).startswith('.')
+
+
+def scan_vault_integrity() -> dict:
+    """Serialize a read-only structural inventory with concurrent vault mutations."""
+    with VAULT_OPERATION_LOCK:
+        return _scan_vault_integrity_unlocked()
+
+
+def _scan_vault_integrity_unlocked() -> dict:
+    """Inventory index/data discrepancies without decrypting or modifying payloads."""
+    expected_contexts = {}
+    conflicts = defaultdict(set)
+    missing_media = []
+    missing_thumbnails = []
+    placeholder_count = 0
+
+    actual_files = set()
+    unexpected_entries = []
+    if os.path.isdir(DATA_DIR):
+        for entry in os.scandir(DATA_DIR):
+            if not entry.is_file(follow_symlinks=False):
+                unexpected_entries.append({
+                    'name': entry.name,
+                    'type': 'symlink' if entry.is_symlink() else 'directory',
+                })
+                continue
+            try:
+                validate_encrypted_id(entry.name)
+            except ValueError:
+                unexpected_entries.append({'name': entry.name, 'type': 'invalid filename'})
+                continue
+            actual_files.add(entry.name)
+
+    for item in DECRYPTED_INDEX:
+        if is_internal_placeholder(item):
+            placeholder_count += 1
+            continue
+
+        media_id = item.get('enc_id')
+        thumb_id = item.get('enc_thumb_id')
+        for identifier, kind in ((media_id, 'media'), (thumb_id, 'thumb')):
+            if not identifier:
+                continue
+            validate_encrypted_id(identifier)
+            context = f'{kind}:{identifier}'
+            expected_contexts.setdefault(identifier, context)
+            conflicts[identifier].add(context)
+
+        summary = {
+            'enc_id': media_id,
+            'name': str(item.get('name', '')),
+            'subfolder': str(item.get('subfolder') or ''),
+            'size': int(item.get('size') or 0),
+        }
+        if media_id and media_id not in actual_files:
+            missing_media.append(summary)
+        if thumb_id and thumb_id not in actual_files:
+            missing_thumbnails.append({**summary, 'enc_thumb_id': thumb_id})
+
+    context_conflicts = [
+        {'enc_id': identifier, 'contexts': sorted(contexts)}
+        for identifier, contexts in conflicts.items() if len(contexts) > 1
+    ]
+    unindexed = [
+        {
+            'enc_id': identifier,
+            'size': os.path.getsize(safe_vault_path(identifier)),
+        }
+        for identifier in sorted(actual_files - set(expected_contexts))
+    ]
+    missing_media.sort(key=lambda item: (item['name'].lower(), item['enc_id']))
+    missing_thumbnails.sort(key=lambda item: (item['name'].lower(), item['enc_thumb_id']))
+    unexpected_entries.sort(key=lambda item: item['name'].lower())
+    context_conflicts.sort(key=lambda item: item['enc_id'])
+
+    healthy = not any((missing_media, missing_thumbnails, unindexed, unexpected_entries, context_conflicts))
+    return {
+        'healthy': healthy,
+        'migration_blocked': bool(missing_media or missing_thumbnails or unindexed or unexpected_entries or context_conflicts),
+        'placeholder_count': placeholder_count,
+        'missing_media': missing_media,
+        'missing_thumbnails': missing_thumbnails,
+        'unindexed_ciphertext': unindexed,
+        'unexpected_entries': unexpected_entries,
+        'context_conflicts': context_conflicts,
+        'counts': {
+            'missing_media': len(missing_media),
+            'missing_thumbnails': len(missing_thumbnails),
+            'unindexed_ciphertext': len(unindexed),
+            'unexpected_entries': len(unexpected_entries),
+            'context_conflicts': len(context_conflicts),
+        },
+    }
+
+
+def _create_integrity_recovery(action: str) -> tuple[str, dict]:
+    """Create a unique recovery bundle and preserve the encrypted pre-repair index."""
+    token = secrets.token_hex(4)
+    stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    recovery_dir = os.path.join(VAULT_FOLDER, 'vault_recovery', f'integrity-{stamp}-{token}')
+    os.makedirs(recovery_dir, exist_ok=False)
+    if os.path.isfile(INDEX_PATH):
+        shutil.copy2(INDEX_PATH, os.path.join(recovery_dir, 'original-vault_index.json'))
+    manifest = {
+        'format': 'CryptHaven integrity recovery',
+        'version': 1,
+        'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'action': action,
+        'vault_format_version': active_vault_format_version(),
+    }
+    return recovery_dir, manifest
+
+
+def _write_integrity_manifest(recovery_dir: str, manifest: dict):
+    atomic_write(
+        os.path.join(recovery_dir, 'manifest.json'),
+        (json.dumps(manifest, indent=2, sort_keys=True) + '\n').encode('utf-8'),
+    )
+
+
+def repair_vault_integrity(action: str, requested_ids: list) -> dict:
+    """Apply one explicitly scoped repair while preserving recovery material."""
+    if action not in {'clear_missing_thumbnails', 'remove_missing_media', 'quarantine_unindexed'}:
+        raise ValueError('Unsupported integrity repair action')
+    if not isinstance(requested_ids, list) or not requested_ids or len(requested_ids) > 10000:
+        raise ValueError('Select between 1 and 10,000 ciphertext identifiers')
+    identifiers = []
+    seen = set()
+    for value in requested_ids:
+        identifier = validate_encrypted_id(value)
+        if identifier not in seen:
+            identifiers.append(identifier)
+            seen.add(identifier)
+
+    with VAULT_OPERATION_LOCK:
+        report = scan_vault_integrity()
+        if report['context_conflicts'] or report['unexpected_entries']:
+            raise ValueError('Resolve identifier conflicts and unexpected data entries manually before repairing')
+
+        selected = set(identifiers)
+        if action == 'clear_missing_thumbnails':
+            eligible = {item['enc_thumb_id'] for item in report['missing_thumbnails']}
+            stale_error = 'Selection includes a thumbnail that is no longer missing'
+        elif action == 'remove_missing_media':
+            eligible = {item['enc_id'] for item in report['missing_media']}
+            stale_error = 'Selection includes media that is no longer missing'
+        else:
+            eligible = {item['enc_id'] for item in report['unindexed_ciphertext']}
+            stale_error = 'Selection includes ciphertext that is no longer unindexed'
+        if not selected <= eligible:
+            raise ValueError(stale_error)
+
+        recovery_dir, manifest = _create_integrity_recovery(action)
+        manifest['requested_ids'] = identifiers
+        manifest['status'] = 'repair started'
+        _write_integrity_manifest(recovery_dir, manifest)
+
+        if action == 'clear_missing_thumbnails':
+            changed = []
+            for item in DECRYPTED_INDEX:
+                if item.get('enc_thumb_id') in selected:
+                    changed.append({'enc_id': item.get('enc_id'), 'enc_thumb_id': item['enc_thumb_id']})
+                    item['enc_thumb_id'] = None
+            try:
+                save_index()
+            except Exception:
+                original_refs = {entry['enc_id']: entry['enc_thumb_id'] for entry in changed}
+                for item in DECRYPTED_INDEX:
+                    if item.get('enc_id') in original_refs:
+                        item['enc_thumb_id'] = original_refs[item['enc_id']]
+                raise
+            manifest['cleared_thumbnail_references'] = changed
+            affected = len(changed)
+
+        elif action == 'remove_missing_media':
+            items = [item for item in DECRYPTED_INDEX if item.get('enc_id') in selected]
+            ciphertext_dir = os.path.join(recovery_dir, 'ciphertext')
+            copied = []
+            for item in items:
+                thumb_id = item.get('enc_thumb_id')
+                if thumb_id and os.path.isfile(safe_vault_path(thumb_id)):
+                    os.makedirs(ciphertext_dir, exist_ok=True)
+                    shutil.copy2(safe_vault_path(thumb_id), os.path.join(ciphertext_dir, thumb_id))
+                    copied.append(thumb_id)
+            manifest['removed_index_records'] = [
+                {'enc_id': item.get('enc_id'), 'enc_thumb_id': item.get('enc_thumb_id')}
+                for item in items
+            ]
+            manifest['preserved_companion_ciphertext'] = copied
+            affected = commit_item_deletions(items)
+
+        else:
+            ciphertext_dir = os.path.join(recovery_dir, 'ciphertext')
+            os.makedirs(ciphertext_dir, exist_ok=True)
+            moved = []
+            try:
+                for identifier in identifiers:
+                    source = safe_vault_path(identifier)
+                    destination = os.path.join(ciphertext_dir, identifier)
+                    os.replace(source, destination)
+                    moved.append(identifier)
+            except Exception:
+                for identifier in reversed(moved):
+                    os.replace(os.path.join(ciphertext_dir, identifier), safe_vault_path(identifier))
+                raise
+            manifest['quarantined_ciphertext'] = moved
+            affected = len(moved)
+
+        manifest['affected_count'] = affected
+        manifest['status'] = 'completed'
+        _write_integrity_manifest(recovery_dir, manifest)
+        return {
+            'success': True,
+            'action': action,
+            'affected_count': affected,
+            'recovery_path': recovery_dir,
+            'report': scan_vault_integrity(),
+        }
+
+
 def migrate_vault_to_v3(password: str, *, _fault_at: str | None = None) -> int:
     """Transactionally migrate an unlocked v1 or v2 vault to context-bound v3."""
     global ACTIVE_DEK, ACTIVE_FERNET, MIGRATION_IN_PROGRESS
@@ -1261,6 +1548,8 @@ def migrate_vault_to_v3(password: str, *, _fault_at: str | None = None) -> int:
     expected_contexts = {}
     media_ids = set()
     for item in DECRYPTED_INDEX:
+        if is_internal_placeholder(item):
+            continue
         identifiers = (
             (item.get('enc_id'), 'media'),
             (item.get('enc_thumb_id'), 'thumb'),
@@ -1614,6 +1903,19 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({'success': True, 'message': 'Logged out!'}).encode('utf-8'))
+            return
+
+        if parsed.path == '/api/admin/integrity/repair':
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(length).decode('utf-8') if length > 0 else '{}'
+                request = json.loads(body)
+                result = repair_vault_integrity(request.get('action'), request.get('enc_ids'))
+                self.send_json(result)
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                self.send_json({'success': False, 'error': str(exc)}, status=400)
+            except Exception as exc:
+                self.send_json({'success': False, 'error': f'Integrity repair failed: {exc}'}, status=500)
             return
 
         if parsed.path == '/api/admin/cloud_backup':
@@ -2154,6 +2456,13 @@ class VaultGalleryHandler(BaseHTTPRequestHandler):
             return
 
         # Cryptographic SHA-256 Hash Duplicate Scanner
+        if parsed.path == '/api/admin/integrity':
+            try:
+                self.send_json(scan_vault_integrity())
+            except Exception as exc:
+                self.send_json({'success': False, 'error': f'Integrity scan failed: {exc}'}, status=500)
+            return
+
         if parsed.path == '/api/admin/duplicates':
             if not ACTIVE_DEK and not ACTIVE_FERNET:
                 self.send_json({'success': False, 'error': 'Vault locked'}, status=401)
@@ -2993,6 +3302,20 @@ HTML_GALLERY = """<!DOCTYPE html>
         </div>
     </div>
 
+    <div class="modal" id="integrity-modal">
+        <div class="m-card" style="max-width:760px;">
+            <h3>Vault Integrity &amp; Repair</h3>
+            <p id="integrity-summary" style="color:#94a3b8; font-size:0.88rem;">Scanning encrypted vault structure...</p>
+            <div id="integrity-details" style="max-height:48vh; overflow-y:auto;"></div>
+            <button style="background:#475569; color:#fff; margin-top:0.8rem;" onclick="loadIntegrityReport()">Scan Again</button>
+            <button id="integrity-clear-thumbs" style="background:#0f766e; color:#fff; margin-top:0.5rem; display:none;" onclick="repairMissingThumbnails()">Clear Selected Missing Thumbnail References</button>
+            <button id="integrity-remove-media" style="background:#b91c1c; color:#fff; margin-top:0.5rem; display:none;" onclick="repairMissingMedia()">Remove Selected Missing Media Records</button>
+            <button id="integrity-quarantine" style="background:#b45309; color:#fff; margin-top:0.5rem; display:none;" onclick="quarantineUnindexedCiphertext()">Quarantine Selected Unindexed Ciphertext</button>
+            <p style="color:#64748b; font-size:0.78rem; margin-top:0.8rem;">Every repair creates an encrypted index backup and manifest under vault_recovery. Orphaned ciphertext is moved there, never deleted.</p>
+            <button style="background:#334155; color:#fff; margin-top:0.5rem;" onclick="closeModal('integrity-modal')">Close</button>
+        </div>
+    </div>
+
     <div class="modal" id="admin-modal">
         <div class="m-card">
             <h3>📊 Vault Statistics & Admin</h3>
@@ -3010,6 +3333,7 @@ HTML_GALLERY = """<!DOCTYPE html>
 
             <button style="background:#0284c7; color:#fff;" onclick="triggerCloudBackup()">☁️ Backup Encrypted Vault to Google Drive</button>
             <button style="background:#8b5cf6; color:#fff; margin-top:0.6rem;" onclick="openFolderManagerModal()">📁 Open Full Folder Manager</button>
+            <button style="background:#0f766e; color:#fff; margin-top:0.6rem;" onclick="openIntegrityModal()">Vault Integrity &amp; Repair</button>
             <button id="admin-migrate-btn" style="background:#f59e0b; color:#fff; margin-top:0.6rem; display:none;" onclick="migrateVaultPrompt()">⚡ Migrate Vault to Context-Bound v3</button>
             <button style="background:#6366f1; color:#fff; margin-top:0.6rem;" onclick="changePasswordPrompt()">🔑 Change Password</button>
             <button style="background:#0284c7; color:#fff; margin-top:0.6rem;" onclick="exportVaultPrompt()">🔓 Decrypt All Files to PC</button>
@@ -3037,10 +3361,14 @@ HTML_GALLERY = """<!DOCTYPE html>
         let files = [];
         let folders = [];
         let duplicateData = null;
+        let integrityData = null;
         let currentSubfolder = '__ALL__';
         let currentIndex = 0;
         let selectedEncIds = new Set();
         let selectedDupIds = new Set();
+        let selectedIntegrityThumbIds = new Set();
+        let selectedIntegrityMediaIds = new Set();
+        let selectedIntegrityOrphanIds = new Set();
         let isSelectMode = false;
         
         const preloadedCache = {};
@@ -3474,6 +3802,159 @@ HTML_GALLERY = """<!DOCTYPE html>
                 }
             } catch(e) {
                 console.log("Stats update error:", e);
+            }
+        }
+
+        async function openIntegrityModal() {
+            closeModal('admin-modal');
+            const modal = document.getElementById('integrity-modal');
+            if(modal) modal.classList.add('active');
+            await loadIntegrityReport();
+        }
+
+        async function loadIntegrityReport() {
+            safeSetText('integrity-summary', 'Scanning encrypted vault structure...');
+            const details = document.getElementById('integrity-details');
+            if(details) details.replaceChildren();
+            const res = await authFetch('/api/admin/integrity');
+            if(!res) return;
+            const data = await res.json();
+            if(!res.ok || data.error) {
+                safeSetText('integrity-summary', data.error || 'Integrity scan failed.');
+                return;
+            }
+            renderIntegrityReport(data);
+        }
+
+        function integrityIssueSection(title, entries, selection, idKey, labelBuilder, selectByDefault=false) {
+            if(!entries.length) return null;
+            const section = document.createElement('div');
+            section.style.cssText = 'background:#0f172a;border:1px solid #334155;border-radius:8px;padding:0.7rem;margin-top:0.6rem;';
+            const heading = document.createElement('div');
+            heading.style.cssText = 'font-weight:700;color:#e2e8f0;margin-bottom:0.4rem;';
+            heading.textContent = `${title} (${entries.length})`;
+            section.appendChild(heading);
+            entries.forEach(entry => {
+                const identifier = String(entry[idKey] || '');
+                const row = document.createElement('label');
+                row.style.cssText = 'display:flex;align-items:flex-start;gap:0.5rem;padding:0.35rem 0;color:#cbd5e1;font-size:0.82rem;word-break:break-word;';
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.checked = selectByDefault;
+                if(selectByDefault) selection.add(identifier);
+                checkbox.addEventListener('change', () => {
+                    if(checkbox.checked) selection.add(identifier);
+                    else selection.delete(identifier);
+                });
+                const text = document.createElement('span');
+                text.textContent = labelBuilder(entry);
+                row.append(checkbox, text);
+                section.appendChild(row);
+            });
+            return section;
+        }
+
+        function integrityInfoSection(title, entries, labelBuilder) {
+            if(!entries.length) return null;
+            const section = document.createElement('div');
+            section.style.cssText = 'background:#29140c;border:1px solid #9a3412;border-radius:8px;padding:0.7rem;margin-top:0.6rem;';
+            const heading = document.createElement('div');
+            heading.style.cssText = 'font-weight:700;color:#fdba74;margin-bottom:0.4rem;';
+            heading.textContent = `${title} (${entries.length}) - manual review required`;
+            section.appendChild(heading);
+            entries.forEach(entry => {
+                const row = document.createElement('div');
+                row.style.cssText = 'color:#fed7aa;font-size:0.82rem;padding:0.25rem 0;word-break:break-word;';
+                row.textContent = labelBuilder(entry);
+                section.appendChild(row);
+            });
+            return section;
+        }
+
+        function renderIntegrityReport(data) {
+            integrityData = data;
+            selectedIntegrityThumbIds.clear();
+            selectedIntegrityMediaIds.clear();
+            selectedIntegrityOrphanIds.clear();
+            const counts = data.counts || {};
+            const total = Number(counts.missing_media || 0) + Number(counts.missing_thumbnails || 0) +
+                Number(counts.unindexed_ciphertext || 0) + Number(counts.unexpected_entries || 0) +
+                Number(counts.context_conflicts || 0);
+            safeSetText(
+                'integrity-summary',
+                data.healthy
+                    ? `Healthy: no structural discrepancies found. ${Number(data.placeholder_count || 0)} internal folder placeholder(s) ignored as intended.`
+                    : `${total} structural discrepancy item(s) found. Review each category before migration or repair.`
+            );
+            const details = document.getElementById('integrity-details');
+            if(!details) return;
+            details.replaceChildren();
+            const sections = [
+                integrityIssueSection('Missing media ciphertext', data.missing_media || [], selectedIntegrityMediaIds, 'enc_id', entry => `${entry.name} - ${entry.enc_id}`),
+                integrityIssueSection('Missing thumbnail ciphertext', data.missing_thumbnails || [], selectedIntegrityThumbIds, 'enc_thumb_id', entry => `${entry.name} - ${entry.enc_thumb_id}`, true),
+                integrityIssueSection('Unindexed ciphertext', data.unindexed_ciphertext || [], selectedIntegrityOrphanIds, 'enc_id', entry => `${entry.enc_id} (${Number(entry.size || 0).toLocaleString()} bytes)`),
+                integrityInfoSection('Unexpected data entries', data.unexpected_entries || [], entry => `${entry.name} (${entry.type})`),
+                integrityInfoSection('Ciphertext context conflicts', data.context_conflicts || [], entry => `${entry.enc_id}: ${(entry.contexts || []).join(', ')}`),
+            ];
+            sections.forEach(section => { if(section) details.appendChild(section); });
+            if(data.healthy) {
+                const healthy = document.createElement('div');
+                healthy.style.cssText = 'background:#052e2b;border:1px solid #0f766e;border-radius:8px;padding:0.8rem;color:#99f6e4;';
+                healthy.textContent = 'The index and encrypted data directory are structurally consistent.';
+                details.appendChild(healthy);
+            }
+            document.getElementById('integrity-clear-thumbs').style.display = (data.missing_thumbnails || []).length ? 'block' : 'none';
+            document.getElementById('integrity-remove-media').style.display = (data.missing_media || []).length ? 'block' : 'none';
+            document.getElementById('integrity-quarantine').style.display = (data.unindexed_ciphertext || []).length ? 'block' : 'none';
+        }
+
+        async function submitIntegrityRepair(action, selectedIds) {
+            const res = await authFetch('/api/admin/integrity/repair', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({action: action, enc_ids: Array.from(selectedIds)})
+            });
+            if(!res) return;
+            const data = await res.json();
+            if(!res.ok || !data.success) {
+                alert(data.error || 'Integrity repair failed.');
+                return;
+            }
+            alert(`Repair completed for ${Number(data.affected_count || 0)} item(s).\nRecovery bundle: ${data.recovery_path}`);
+            renderIntegrityReport(data.report);
+            loadFolders();
+            loadFiles(currentSubfolder);
+        }
+
+        async function repairMissingThumbnails() {
+            if(!selectedIntegrityThumbIds.size) {
+                alert('Select at least one missing thumbnail reference.');
+                return;
+            }
+            if(confirm('Clear the selected missing thumbnail references? Thumbnails will regenerate from available media when requested.')) {
+                await submitIntegrityRepair('clear_missing_thumbnails', selectedIntegrityThumbIds);
+            }
+        }
+
+        async function repairMissingMedia() {
+            if(!selectedIntegrityMediaIds.size) {
+                alert('Select the missing media records you have confirmed are unrecoverable.');
+                return;
+            }
+            const confirmation = prompt('This removes selected records from the encrypted index. Type REMOVE to continue:');
+            if(confirmation === 'REMOVE') {
+                await submitIntegrityRepair('remove_missing_media', selectedIntegrityMediaIds);
+            }
+        }
+
+        async function quarantineUnindexedCiphertext() {
+            if(!selectedIntegrityOrphanIds.size) {
+                alert('Select at least one unindexed ciphertext file.');
+                return;
+            }
+            const confirmation = prompt('Selected files will be moved to a reversible recovery bundle, not deleted. Type QUARANTINE to continue:');
+            if(confirmation === 'QUARANTINE') {
+                await submitIntegrityRepair('quarantine_unindexed', selectedIntegrityOrphanIds);
             }
         }
 
@@ -4172,22 +4653,19 @@ def on_exit_server(icon, item):
 
 
 def stop_servers():
-    global SERVER_HTTPD, SERVER_HTTPS
+    global SERVER_HTTPD, SERVER_HTTPS, SERVER_HTTP_LISTENERS, SERVER_HTTPS_LISTENERS
     lock_vault()
-    if SERVER_HTTPD:
+    listeners = list(dict.fromkeys(SERVER_HTTP_LISTENERS + SERVER_HTTPS_LISTENERS))
+    for server in listeners:
         try:
-            SERVER_HTTPD.shutdown()
-            SERVER_HTTPD.server_close()
+            server.shutdown()
+            server.server_close()
         except Exception:
             pass
-        SERVER_HTTPD = None
-    if SERVER_HTTPS:
-        try:
-            SERVER_HTTPS.shutdown()
-            SERVER_HTTPS.server_close()
-        except Exception:
-            pass
-        SERVER_HTTPS = None
+    SERVER_HTTP_LISTENERS = []
+    SERVER_HTTPS_LISTENERS = []
+    SERVER_HTTPD = None
+    SERVER_HTTPS = None
 
 
 class ThreadedHTTPServer(ThreadingHTTPServer):
@@ -4207,7 +4685,7 @@ class HTTPRedirectHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         requested_host = self.headers.get('Host', '').split(':', 1)[0].strip().lower()
-        allowed_hosts = {'localhost', '127.0.0.1', LOCAL_IP.lower()}
+        allowed_hosts = {'localhost', '127.0.0.1', *(address.lower() for address in LAN_IPS)}
         host = requested_host if requested_host in allowed_hosts else LOCAL_IP
         target = f"https://{host}:{HTTPS_PORT}{self.path}"
         self.send_response(307)
@@ -4219,7 +4697,7 @@ class HTTPRedirectHandler(BaseHTTPRequestHandler):
 
 
 def bind_http_server(start_port):
-    """Bind HTTP listeners across both 127.0.0.1 and LOCAL_IP that redirect to HTTPS."""
+    """Bind redirect listeners on loopback and every detected private LAN address."""
     servers = []
     actual_port = None
 
@@ -4228,23 +4706,25 @@ def bind_http_server(start_port):
             s1 = ThreadedHTTPServer(('127.0.0.1', p), HTTPRedirectHandler)
             servers.append(s1)
             actual_port = p
-
-            if LOCAL_IP and LOCAL_IP != '127.0.0.1' and LOCAL_IP != str(ipaddress.IPv4Address(0)):
+            for address in LAN_IPS:
                 try:
-                    s2 = ThreadedHTTPServer((LOCAL_IP, p), HTTPRedirectHandler)
-                    servers.append(s2)
-                except Exception as e:
-                    print(f"LAN Listener Notice for {LOCAL_IP}:{p}: {e}")
+                    server = ThreadedHTTPServer((address, p), HTTPRedirectHandler)
+                    servers.append(server)
+                except OSError as exc:
+                    print(f"LAN Listener Notice for {address}:{p}: {exc}")
             break
         except OSError:
-            servers.clear()
+            for server in servers:
+                server.server_close()
+            servers = []
+            actual_port = None
             continue
 
     return servers, actual_port
 
 
 def bind_https_server(start_port):
-    """Bind HTTPS listeners across loopback and LAN IP."""
+    """Bind HTTPS listeners across loopback and every detected private LAN address."""
     if not generate_self_signed_ssl_certificate():
         return [], None
 
@@ -4261,39 +4741,46 @@ def bind_https_server(start_port):
             s1.socket = ctx.wrap_socket(s1.socket, server_side=True)
             servers.append(s1)
             actual_port = p
-
-            if LOCAL_IP and LOCAL_IP != '127.0.0.1' and LOCAL_IP != str(ipaddress.IPv4Address(0)):
+            for address in LAN_IPS:
                 try:
-                    ctx2 = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-                    ctx2.minimum_version = ssl.TLSVersion.TLSv1_2
-                    ctx2.load_cert_chain(certfile=CERT_PATH, keyfile=KEY_PATH)
-                    s2 = ThreadedHTTPServer((LOCAL_IP, p), VaultGalleryHandler)
-                    s2.socket = ctx2.wrap_socket(s2.socket, server_side=True)
-                    servers.append(s2)
-                except Exception:
-                    pass
+                    server = ThreadedHTTPServer((address, p), VaultGalleryHandler)
+                    server.socket = ctx.wrap_socket(server.socket, server_side=True)
+                    servers.append(server)
+                except OSError as exc:
+                    print(f"HTTPS LAN Listener Notice for {address}:{p}: {exc}")
             break
-        except Exception:
-            servers.clear()
+        except (OSError, ssl.SSLError):
+            for server in servers:
+                server.server_close()
+            servers = []
+            actual_port = None
             continue
 
     return servers, actual_port
 
 
 def start_servers():
-    global SERVER_HTTPD, SERVER_HTTPS, PORT, HTTPS_PORT
+    global SERVER_HTTPD, SERVER_HTTPS, SERVER_HTTP_LISTENERS, SERVER_HTTPS_LISTENERS
+    global PORT, HTTPS_PORT
 
     http_servers, actual_http_port = bind_http_server(PORT)
     if not http_servers:
         return False, f"Could not bind HTTP server to any port between {PORT}-{PORT + 20}. Check if another application or CryptHaven instance is already running."
 
     PORT = actual_http_port
+    SERVER_HTTP_LISTENERS = http_servers
     SERVER_HTTPD = http_servers[0]
 
     https_servers, actual_https_port = bind_https_server(HTTPS_PORT)
-    if https_servers:
-        HTTPS_PORT = actual_https_port
-        SERVER_HTTPS = https_servers[0]
+    if not https_servers:
+        for server in http_servers:
+            server.server_close()
+        SERVER_HTTP_LISTENERS = []
+        SERVER_HTTPD = None
+        return False, f"Could not bind HTTPS server to any port between {HTTPS_PORT}-{HTTPS_PORT + 20}."
+    HTTPS_PORT = actual_https_port
+    SERVER_HTTPS_LISTENERS = https_servers
+    SERVER_HTTPS = https_servers[0]
 
     def run_server_instance(srv):
         try:
@@ -4306,25 +4793,6 @@ def start_servers():
 
     for srv in https_servers:
         threading.Thread(target=run_server_instance, args=(srv,), daemon=True).start()
-
-    return True, "Servers started successfully"
-
-    def run_http():
-        try:
-            SERVER_HTTPD.serve_forever()
-        except Exception as e:
-            print(f"HTTP Server notice: {e}")
-
-    def run_https():
-        if SERVER_HTTPS:
-            try:
-                SERVER_HTTPS.serve_forever()
-            except Exception as e:
-                print(f"HTTPS Server notice: {e}")
-
-    threading.Thread(target=run_http, daemon=True).start()
-    if SERVER_HTTPS:
-        threading.Thread(target=run_https, daemon=True).start()
 
     return True, "Servers started successfully"
 
@@ -4372,8 +4840,12 @@ def run_vault_cycle(selected_vault_dir=None):
 
     print(f"=======================================================================")
     print(f"🔒 CryptHaven — Encrypted Media Vault Server")
-    print(f"  HTTP Access:  http://{LOCAL_IP}:{PORT} (or http://127.0.0.1:{PORT})")
-    print(f"  HTTPS Access: https://{LOCAL_IP}:{HTTPS_PORT} (or https://127.0.0.1:{HTTPS_PORT})")
+    if LAN_IPS:
+        for address in LAN_IPS:
+            print(f"  LAN Access:   https://{address}:{HTTPS_PORT} (HTTP redirect: {PORT})")
+    else:
+        print("  LAN Access:   No RFC1918 network interface detected")
+    print(f"  Local Access: https://127.0.0.1:{HTTPS_PORT}")
     print(f"  Vault Directory: {VAULT_FOLDER}")
     print(f"  Remote Shutdown: {'ENABLED' if ENABLE_REMOTE_SHUTDOWN else 'disabled'}")
     print(f"=======================================================================")

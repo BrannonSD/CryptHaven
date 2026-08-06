@@ -11,6 +11,7 @@ vault/vault_cert.pem
 vault/vault_key.pem
 vault/vault_migration.json
 vault/.migration-*/
+vault/vault_recovery/
 vault/Exported_Decrypted_Media/
 *.exe
 build/
