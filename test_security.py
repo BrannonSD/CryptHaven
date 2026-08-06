@@ -1,430 +1,563 @@
+"""Adversarial security and compatibility tests for CryptHaven.
+
+All filesystem tests use temporary vaults. No repository or user vault data is read.
 """
-CryptHaven Security Upgrade — Validation Test Suite
-Run after each phase: python test_security.py
-"""
-import os
-import sys
-import json
-import secrets
+
 import base64
-import tempfile
+import json
+import http.client
+import os
+import secrets
 import shutil
+import ssl
+import tempfile
+import threading
 import time
+import unittest
+import urllib.parse
+from unittest import mock
 
-# ---------------------------------------------------------------------------
-# Ensure we can import from crypthaven_server
-# ---------------------------------------------------------------------------
-if sys.stdout is not None and hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8')
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cryptography.exceptions import InvalidTag
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-PASS_COUNT = 0
-FAIL_COUNT = 0
+import crypthaven_server as cs
 
-def test(name, condition, detail=""):
-    global PASS_COUNT, FAIL_COUNT
-    if condition:
-        print(f"  ✅ PASS: {name}")
-        PASS_COUNT += 1
-    else:
-        print(f"  ❌ FAIL: {name} — {detail}")
-        FAIL_COUNT += 1
 
-def heading(title):
-    print(f"\n{'='*60}")
-    print(f"  {title}")
-    print(f"{'='*60}")
+PASSWORD = "Correct Horse Battery Staple!"
+NEW_PASSWORD = "A Different Strong Password!"
 
-# ===========================================================================
-# PHASE 0 — Import Checks
-# ===========================================================================
-def test_phase0():
-    heading("Phase 0 — Import & Dependency Checks")
 
-    try:
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        test("AESGCM importable", True)
-    except ImportError as e:
-        test("AESGCM importable", False, str(e))
+class TemporaryVaultTestCase(unittest.TestCase):
+    def setUp(self):
+        cs.lock_vault()
+        self.temp_dir = tempfile.mkdtemp(prefix="crypthaven_security_test_")
+        cs.set_vault_folder(self.temp_dir)
 
-    try:
-        import argon2
-        test("argon2-cffi importable", True)
-    except ImportError as e:
-        test("argon2-cffi importable", False, str(e))
+    def tearDown(self):
+        cs.lock_vault()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    try:
-        from argon2.low_level import hash_secret_raw, Type
-        raw = hash_secret_raw(
-            secret=b"test",
-            salt=b"0" * 16,
-            time_cost=1,
-            memory_cost=16384,
-            parallelism=1,
-            hash_len=32,
-            type=Type.ID
+    def initialize(self, password=PASSWORD):
+        success, message = cs.load_vault(password, allow_initialize=True)
+        self.assertTrue(success, message)
+
+    def create_legacy_vault(self):
+        salt = secrets.token_bytes(16)
+        fernet = Fernet(cs.derive_key(PASSWORD, salt))
+        item = {
+            "enc_id": "enc_legacy_media.enc",
+            "name": "legacy.jpg",
+            "subfolder": "",
+            "rel_path": "legacy.jpg",
+            "size": 18,
+            "is_video": False,
+            "is_live_photo": False,
+            "mtime": time.time(),
+            "starred": False,
+            "enc_thumb_id": "enc_legacy_thumb.enc",
+        }
+        plaintext = b"legacy media bytes"
+        thumbnail = b"legacy thumbnail"
+        cs.atomic_write(cs.SALT_PATH, salt)
+        cs.atomic_write(cs.INDEX_PATH, fernet.encrypt(json.dumps([item]).encode("utf-8")))
+        cs.atomic_write(cs.safe_vault_path(item["enc_id"]), fernet.encrypt(plaintext))
+        cs.atomic_write(cs.safe_vault_path(item["enc_thumb_id"]), fernet.encrypt(thumbnail))
+        success, message = cs.load_vault(PASSWORD)
+        self.assertTrue(success, message)
+        return item, plaintext, thumbnail
+
+    def create_v2_vault(self):
+        salt = secrets.token_bytes(cs.KEK_SALT_SIZE)
+        dek = cs.generate_dek()
+        kek = cs.derive_kek(PASSWORD, salt)
+        item = {
+            "enc_id": "enc_v2_media.enc",
+            "name": "v2.jpg",
+            "subfolder": "",
+            "rel_path": "v2.jpg",
+            "size": 14,
+            "is_video": False,
+            "is_live_photo": False,
+            "mtime": time.time(),
+            "starred": False,
+            "enc_thumb_id": "enc_v2_thumb.enc",
+        }
+        plaintext = b"v2 media bytes"
+        thumbnail = b"v2 thumbnail"
+
+        def encrypt_v2(value):
+            nonce = secrets.token_bytes(cs.NONCE_SIZE)
+            return b"\x02" + nonce + AESGCM(dek).encrypt(nonce, value, None)
+
+        cs.atomic_write(cs.SALT_PATH, salt)
+        cs.atomic_write(cs.DEK_PATH, cs.wrap_dek(dek, kek))
+        cs.atomic_write(cs.INDEX_PATH, encrypt_v2(json.dumps([item]).encode("utf-8")))
+        cs.atomic_write(cs.safe_vault_path(item["enc_id"]), encrypt_v2(plaintext))
+        cs.atomic_write(cs.safe_vault_path(item["enc_thumb_id"]), encrypt_v2(thumbnail))
+        success, message = cs.load_vault(PASSWORD)
+        self.assertTrue(success, message)
+        return item, plaintext, thumbnail, dek
+
+
+class VaultHistoryTests(unittest.TestCase):
+    def test_pyinstaller_temp_entries_are_removed_and_not_readded(self):
+        with tempfile.TemporaryDirectory(prefix="crypthaven_history_test_") as appdata:
+            real_vault = os.path.join(appdata, "Real Vault")
+            os.makedirs(real_vault)
+            stale_vault = os.path.join(appdata, "Local", "Temp", "_MEI123456", "vault")
+            with mock.patch.dict(os.environ, {"APPDATA": appdata}, clear=False):
+                config_path = cs.get_config_path()
+                with open(config_path, "w", encoding="utf-8") as config_file:
+                    json.dump({"recent_vaults": [stale_vault, real_vault, real_vault]}, config_file)
+
+                self.assertEqual(cs.load_vault_history(), [os.path.abspath(real_vault)])
+                cs.add_to_vault_history(stale_vault)
+                self.assertEqual(cs.load_vault_history(), [os.path.abspath(real_vault)])
+                with open(config_path, "r", encoding="utf-8") as config_file:
+                    self.assertEqual(
+                        json.load(config_file)["recent_vaults"],
+                        [os.path.abspath(real_vault)],
+                    )
+
+
+class EncryptionCoreTests(unittest.TestCase):
+    def test_v3_round_trip_tamper_and_context_binding(self):
+        dek = cs.generate_dek()
+        plaintext = secrets.token_bytes(4096)
+        ciphertext = cs.vault_encrypt(plaintext, dek, context="media:item-a")
+
+        self.assertEqual(ciphertext[0], 3)
+        self.assertEqual(
+            cs.vault_decrypt(ciphertext, dek, context="media:item-a"), plaintext
         )
-        test("Argon2id produces 32-byte output", len(raw) == 32, f"got {len(raw)}")
-    except Exception as e:
-        test("Argon2id basic operation", False, str(e))
+        with self.assertRaises(InvalidTag):
+            cs.vault_decrypt(ciphertext, dek, context="media:item-b")
 
-# ===========================================================================
-# PHASE 1 — Core Encryption Functions
-# ===========================================================================
-def test_phase1():
-    heading("Phase 1 — Core Encryption Functions")
+        tampered = bytearray(ciphertext)
+        tampered[-1] ^= 1
+        with self.assertRaises(InvalidTag):
+            cs.vault_decrypt(bytes(tampered), dek, context="media:item-a")
 
-    try:
-        from crypthaven_server import vault_encrypt, vault_decrypt, generate_dek
-        from crypthaven_server import derive_kek, wrap_dek, unwrap_dek
-    except ImportError as e:
-        print(f"  ⚠️  Cannot import new functions yet — skip Phase 1 tests ({e})")
-        return
-
-    # Test DEK generation
-    dek = generate_dek()
-    test("generate_dek() returns 32 bytes", len(dek) == 32, f"got {len(dek)}")
-    dek2 = generate_dek()
-    test("generate_dek() is random each time", dek != dek2)
-
-    # Test encrypt/decrypt roundtrip
-    plaintext = b"Hello CryptHaven! This is a test message."
-    ciphertext = vault_encrypt(plaintext, dek)
-    test("vault_encrypt output starts with version byte 0x02",
-         ciphertext[0:1] == b'\x02', f"got {ciphertext[0:1]}")
-    test("vault_encrypt output is larger than plaintext",
-         len(ciphertext) > len(plaintext))
-    decrypted = vault_decrypt(ciphertext, dek)
-    test("vault_decrypt recovers original plaintext",
-         decrypted == plaintext, f"got {decrypted[:50]}")
-
-    # Test that different encryptions produce different ciphertext (unique nonce)
-    ct1 = vault_encrypt(plaintext, dek)
-    ct2 = vault_encrypt(plaintext, dek)
-    test("Same plaintext produces different ciphertext (unique nonce)", ct1 != ct2)
-
-    # Test decryption with wrong key fails
-    wrong_dek = generate_dek()
-    try:
-        vault_decrypt(ciphertext, wrong_dek)
-        test("Decryption with wrong key raises error", False, "did not raise")
-    except Exception:
-        test("Decryption with wrong key raises error", True)
-
-    # Test tampered ciphertext fails
-    tampered = bytearray(ciphertext)
-    tampered[-1] ^= 0xFF  # flip last byte
-    try:
-        vault_decrypt(bytes(tampered), dek)
-        test("Tampered ciphertext raises error", False, "did not raise")
-    except Exception:
-        test("Tampered ciphertext raises error", True)
-
-    # Test KEK derivation
-    salt = secrets.token_bytes(32)
-    kek = derive_kek("testpassword123", salt)
-    test("derive_kek returns 32 bytes", len(kek) == 32, f"got {len(kek)}")
-    kek_same = derive_kek("testpassword123", salt)
-    test("derive_kek is deterministic (same password+salt → same kek)", kek == kek_same)
-    kek_diff = derive_kek("differentpassword", salt)
-    test("derive_kek differs with different password", kek != kek_diff)
-
-    # Test DEK wrapping
-    wrapped = wrap_dek(dek, kek)
-    test("wrap_dek produces output", len(wrapped) > 0)
-    unwrapped = unwrap_dek(wrapped, kek)
-    test("unwrap_dek recovers original DEK", unwrapped == dek)
-
-    # Test unwrap with wrong KEK fails
-    wrong_kek = derive_kek("wrongpassword", salt)
-    try:
-        unwrap_dek(wrapped, wrong_kek)
-        test("unwrap_dek with wrong KEK raises error", False, "did not raise")
-    except Exception:
-        test("unwrap_dek with wrong KEK raises error", True)
-
-    # Test large file encryption (simulating a 5MB photo)
-    large_data = secrets.token_bytes(5 * 1024 * 1024)
-    large_ct = vault_encrypt(large_data, dek)
-    large_pt = vault_decrypt(large_ct, dek)
-    test("Large file (5MB) encrypt/decrypt roundtrip", large_data == large_pt)
-
-    # Test empty data
-    empty_ct = vault_encrypt(b"", dek)
-    empty_pt = vault_decrypt(empty_ct, dek)
-    test("Empty data encrypt/decrypt roundtrip", empty_pt == b"")
-
-# ===========================================================================
-# PHASE 1b — Fernet Backward Compatibility
-# ===========================================================================
-def test_phase1b():
-    heading("Phase 1b — Fernet Backward Compatibility")
-
-    try:
-        from crypthaven_server import vault_decrypt, derive_key
-        from cryptography.fernet import Fernet
-    except ImportError as e:
-        print(f"  ⚠️  Cannot import functions — skip Phase 1b tests ({e})")
-        return
-
-    # Create Fernet-encrypted data (simulating old vault files)
-    salt = secrets.token_bytes(16)
-    old_key = derive_key("oldpassword", salt)
-    fernet = Fernet(old_key)
-    plaintext = b"This was encrypted with the OLD Fernet system."
-    old_ciphertext = fernet.encrypt(plaintext)
-
-    # Verify vault_decrypt can handle old Fernet format with fallback
-    dek = secrets.token_bytes(32)  # dummy DEK — won't be used for Fernet data
-    try:
-        result = vault_decrypt(old_ciphertext, dek, fernet_fallback=fernet)
-        test("vault_decrypt handles legacy Fernet with fallback", result == plaintext)
-    except Exception as e:
-        test("vault_decrypt handles legacy Fernet with fallback", False, str(e))
-
-    # Verify vault_decrypt raises on Fernet data WITHOUT fallback
-    try:
-        vault_decrypt(old_ciphertext, dek, fernet_fallback=None)
-        test("vault_decrypt raises on Fernet data without fallback", False, "did not raise")
-    except (ValueError, Exception):
-        test("vault_decrypt raises on Fernet data without fallback", True)
-
-# ===========================================================================
-# PHASE 2 — Vault Load/Save/Password Change
-# ===========================================================================
-def test_phase2():
-    heading("Phase 2 — Vault Operations")
-
-    try:
-        from crypthaven_server import (
-            set_vault_folder, load_vault, save_index, lock_vault,
-            vault_decrypt, DECRYPTED_INDEX, generate_dek
+    def test_v2_ciphertext_remains_readable(self):
+        dek = cs.generate_dek()
+        nonce = secrets.token_bytes(cs.NONCE_SIZE)
+        plaintext = b"existing v2 payload"
+        legacy_v2 = b"\x02" + nonce + AESGCM(dek).encrypt(nonce, plaintext, None)
+        self.assertEqual(
+            cs.vault_decrypt(legacy_v2, dek, context="ignored-for-v2"), plaintext
         )
-    except ImportError as e:
-        print(f"  ⚠️  Cannot import vault functions — skip Phase 2 tests ({e})")
-        return
 
-    # Create a temporary vault directory
-    tmp_dir = tempfile.mkdtemp(prefix="crypthaven_test_")
-    try:
-        set_vault_folder(tmp_dir)
+    def test_key_wrap_authenticates_aad_and_length(self):
+        dek = cs.generate_dek()
+        kek = cs.generate_dek()
+        wrapped = cs.wrap_dek(dek, kek, b"header-a")
+        self.assertEqual(cs.unwrap_dek(wrapped, kek, b"header-a"), dek)
+        with self.assertRaises(InvalidTag):
+            cs.unwrap_dek(wrapped, kek, b"header-b")
+        with self.assertRaises(ValueError):
+            cs.unwrap_dek(wrapped[:-1], kek, b"header-a")
 
-        # Test new vault creation
-        success, msg = load_vault("MyStr0ngP@ssw0rd!")
-        test("New vault creation succeeds", success, msg)
 
-        # Verify vault files were created
-        dek_path = os.path.join(tmp_dir, "vault_dek.bin")
-        salt_path = os.path.join(tmp_dir, "vault_salt.bin")
-        index_path = os.path.join(tmp_dir, "vault_index.json")
-        test("vault_dek.bin created", os.path.exists(dek_path))
-        test("vault_salt.bin created", os.path.exists(salt_path))
-        test("vault_index.json created", os.path.exists(index_path))
+class VaultStateTests(TemporaryVaultTestCase):
+    def test_initialization_requires_local_authorization_and_password_policy(self):
+        self.assertEqual(cs.vault_metadata_state(self.temp_dir), "empty")
+        success, _ = cs.load_vault(PASSWORD, allow_initialize=False)
+        self.assertFalse(success)
+        success, _ = cs.load_vault("short", allow_initialize=True)
+        self.assertFalse(success)
+        self.assertEqual(cs.vault_metadata_state(self.temp_dir), "empty")
 
-        # Verify salt is 32 bytes
-        with open(salt_path, 'rb') as f:
-            salt_data = f.read()
-        test("Salt is 32 bytes", len(salt_data) == 32, f"got {len(salt_data)}")
+        self.initialize()
+        self.assertEqual(cs.vault_metadata_state(self.temp_dir), "v3")
+        self.assertTrue(os.path.exists(cs.KEY_ENVELOPE_PATH))
+        self.assertFalse(os.path.exists(cs.SALT_PATH))
+        self.assertFalse(os.path.exists(cs.DEK_PATH))
 
-        # Lock and re-unlock
-        lock_vault()
-        success2, msg2 = load_vault("MyStr0ngP@ssw0rd!")
-        test("Re-unlock with correct password succeeds", success2, msg2)
+    def test_partial_metadata_never_reinitializes_or_overwrites_data(self):
+        orphan_path = cs.safe_vault_path("orphan.enc")
+        orphan = secrets.token_bytes(128)
+        cs.atomic_write(orphan_path, orphan)
+        self.assertEqual(cs.vault_metadata_state(self.temp_dir), "damaged")
 
-        # Wrong password
-        lock_vault()
-        success3, msg3 = load_vault("wrongpassword")
-        test("Wrong password fails", not success3)
+        success, message = cs.load_vault(PASSWORD, allow_initialize=True)
+        self.assertFalse(success)
+        self.assertIn("incomplete", message)
+        with open(orphan_path, "rb") as orphan_file:
+            self.assertEqual(orphan_file.read(), orphan)
+        self.assertFalse(os.path.exists(cs.KEY_ENVELOPE_PATH))
+        self.assertFalse(os.path.exists(cs.INDEX_PATH))
 
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    def test_missing_index_fails_closed_without_replacing_key_envelope(self):
+        self.initialize()
+        with open(cs.KEY_ENVELOPE_PATH, "rb") as envelope_file:
+            original_envelope = envelope_file.read()
+        os.remove(cs.INDEX_PATH)
+        cs.lock_vault()
 
-# ===========================================================================
-# PHASE 2b — Password Change (Critical Bug Fix Validation)
-# ===========================================================================
-def test_phase2b():
-    heading("Phase 2b — Password Change (Critical Bug Fix)")
+        success, _ = cs.load_vault(NEW_PASSWORD, allow_initialize=True)
+        self.assertFalse(success)
+        with open(cs.KEY_ENVELOPE_PATH, "rb") as envelope_file:
+            self.assertEqual(envelope_file.read(), original_envelope)
 
-    try:
-        from crypthaven_server import (
-            set_vault_folder, load_vault, save_index, lock_vault,
-            vault_encrypt, vault_decrypt, ACTIVE_DEK
+
+class PasswordChangeTests(TemporaryVaultTestCase):
+    def test_password_change_is_atomic_and_preserves_media_dek(self):
+        self.initialize()
+        original_dek = cs.ACTIVE_DEK
+        media_id = "enc_password_test.enc"
+        plaintext = b"secret media survives password changes"
+        cs.atomic_write(
+            cs.safe_vault_path(media_id),
+            cs.vault_encrypt(plaintext, original_dek, context=f"media:{media_id}"),
         )
-        import crypthaven_server as cs
-    except ImportError as e:
-        print(f"  ⚠️  Cannot import — skip Phase 2b tests ({e})")
-        return
+        with open(cs.KEY_ENVELOPE_PATH, "rb") as envelope_file:
+            original_envelope = envelope_file.read()
 
-    tmp_dir = tempfile.mkdtemp(prefix="crypthaven_pwchange_")
-    try:
-        set_vault_folder(tmp_dir)
-        load_vault("OriginalPassword123!")
+        with self.assertRaises(Exception):
+            cs.change_vault_password("wrong password value", NEW_PASSWORD)
+        with open(cs.KEY_ENVELOPE_PATH, "rb") as envelope_file:
+            self.assertEqual(envelope_file.read(), original_envelope)
 
-        # Simulate uploading a file (encrypt test data and write to data dir)
-        data_dir = os.path.join(tmp_dir, "data")
-        test_file_content = b"THIS IS MY SECRET PHOTO DATA " * 1000
-        encrypted_file = vault_encrypt(test_file_content, cs.ACTIVE_DEK)
-        enc_id = "enc_test_000001.enc"
-        enc_path = os.path.join(data_dir, enc_id)
-        with open(enc_path, 'wb') as f:
-            f.write(encrypted_file)
+        cs.change_vault_password(PASSWORD, NEW_PASSWORD)
+        self.assertEqual(cs.ACTIVE_DEK, original_dek)
+        cs.lock_vault()
+        self.assertFalse(cs.load_vault(PASSWORD)[0])
+        self.assertTrue(cs.load_vault(NEW_PASSWORD)[0])
+        with open(cs.safe_vault_path(media_id), "rb") as media_file:
+            self.assertEqual(
+                cs.vault_decrypt(
+                    media_file.read(), cs.ACTIVE_DEK, context=f"media:{media_id}"
+                ),
+                plaintext,
+            )
 
-        # Add to index
-        cs.DECRYPTED_INDEX.append({
-            "enc_id": enc_id, "name": "test_photo.jpg",
-            "subfolder": "", "rel_path": "test_photo.jpg",
-            "size": len(test_file_content), "is_video": False,
-            "is_live_photo": False, "mtime": time.time(),
-            "starred": False, "enc_thumb_id": None
-        })
-        save_index()
 
-        # Now change the password
-        old_dek = cs.ACTIVE_DEK  # save reference
+class MutationCommitTests(TemporaryVaultTestCase):
+    def test_failed_index_commit_does_not_delete_ciphertext(self):
+        self.initialize()
+        item = {
+            "enc_id": "enc_delete_test.enc",
+            "name": "delete-test.jpg",
+            "subfolder": "",
+            "rel_path": "delete-test.jpg",
+            "size": 4,
+            "is_video": False,
+            "is_live_photo": False,
+            "mtime": time.time(),
+            "starred": False,
+            "enc_thumb_id": None,
+        }
+        media_path = cs.safe_vault_path(item["enc_id"])
+        cs.atomic_write(
+            media_path,
+            cs.vault_encrypt(b"data", cs.ACTIVE_DEK, context=f"media:{item['enc_id']}")
+        )
+        cs.DECRYPTED_INDEX.append(item)
+        cs.save_index()
 
-        # Simulate the password change endpoint logic:
-        from crypthaven_server import derive_kek, wrap_dek
-        salt_path = os.path.join(tmp_dir, "vault_salt.bin")
-        with open(salt_path, 'rb') as f:
-            salt = f.read()
+        original_save_index = cs.save_index
+        cs.save_index = lambda: (_ for _ in ()).throw(RuntimeError("injected failure"))
+        try:
+            with self.assertRaises(RuntimeError):
+                cs.commit_item_deletions([item])
+        finally:
+            cs.save_index = original_save_index
 
-        # Verify old password (this is the fix — must verify first)
-        old_kek = derive_kek("OriginalPassword123!", salt)
+        self.assertIn(item, cs.DECRYPTED_INDEX)
+        self.assertTrue(os.path.exists(media_path))
+        self.assertEqual(cs.commit_item_deletions([item]), 1)
+        self.assertNotIn(item, cs.DECRYPTED_INDEX)
+        self.assertFalse(os.path.exists(media_path))
 
-        # Generate new salt, new KEK
-        new_salt = secrets.token_bytes(32)
-        new_kek = derive_kek("NewSecurePassword456!", new_salt)
 
-        # Re-wrap the SAME DEK
-        new_wrapped = wrap_dek(cs.ACTIVE_DEK, new_kek)
+class MigrationTests(TemporaryVaultTestCase):
+    def test_legacy_migration_stages_verifies_and_commits(self):
+        item, plaintext, thumbnail = self.create_legacy_vault()
+        migrated = cs.migrate_legacy_vault(PASSWORD)
+        self.assertEqual(migrated, 1)
+        self.assertEqual(cs.vault_metadata_state(self.temp_dir), "v3")
+        self.assertFalse(os.path.exists(cs.MIGRATION_JOURNAL_PATH))
+        self.assertFalse(os.path.exists(cs.SALT_PATH))
 
-        # Save new salt and wrapped DEK
-        with open(salt_path, 'wb') as f:
-            f.write(new_salt)
-        dek_path = os.path.join(tmp_dir, "vault_dek.bin")
-        with open(dek_path, 'wb') as f:
-            f.write(new_wrapped)
+        with open(cs.safe_vault_path(item["enc_id"]), "rb") as media_file:
+            self.assertEqual(
+                cs.vault_decrypt(
+                    media_file.read(), cs.ACTIVE_DEK,
+                    context=f"media:{item['enc_id']}"
+                ),
+                plaintext,
+            )
+        with open(cs.safe_vault_path(item["enc_thumb_id"]), "rb") as thumb_file:
+            self.assertEqual(
+                cs.vault_decrypt(
+                    thumb_file.read(), cs.ACTIVE_DEK,
+                    context=f"thumb:{item['enc_thumb_id']}"
+                ),
+                thumbnail,
+            )
 
-        # Lock vault
-        lock_vault()
+    def test_interruption_after_data_swap_rolls_back_legacy_vault(self):
+        item, plaintext, _ = self.create_legacy_vault()
+        with self.assertRaises(RuntimeError):
+            cs.migrate_legacy_vault(PASSWORD, _fault_at="after_data_swap")
 
-        # CRITICAL TEST: Can we unlock with new password AND read the file?
-        success, msg = load_vault("NewSecurePassword456!")
-        test("Unlock with NEW password succeeds", success, msg)
+        self.assertEqual(cs.vault_metadata_state(self.temp_dir), "legacy")
+        self.assertFalse(os.path.exists(cs.MIGRATION_JOURNAL_PATH))
+        cs.lock_vault()
+        self.assertTrue(cs.load_vault(PASSWORD)[0])
+        with open(cs.safe_vault_path(item["enc_id"]), "rb") as media_file:
+            self.assertEqual(cs.ACTIVE_FERNET.decrypt(media_file.read()), plaintext)
 
-        # Read the encrypted file and decrypt it
-        with open(enc_path, 'rb') as f:
-            ct = f.read()
-        pt = vault_decrypt(ct, cs.ACTIVE_DEK)
-        test("File still decrypts after password change", pt == test_file_content,
-             f"Decrypted length: {len(pt)}, expected: {len(test_file_content)}")
+    def test_interruption_after_index_replace_rolls_back_legacy_vault(self):
+        self.create_legacy_vault()
+        with self.assertRaises(RuntimeError):
+            cs.migrate_legacy_vault(PASSWORD, _fault_at="after_index_replace")
+        self.assertEqual(cs.vault_metadata_state(self.temp_dir), "legacy")
+        cs.lock_vault()
+        self.assertTrue(cs.load_vault(PASSWORD)[0])
 
-        # Verify DEK didn't change
-        test("DEK is unchanged after password change", cs.ACTIVE_DEK == old_dek)
+    def test_v2_migration_reencrypts_every_payload_and_preserves_dek(self):
+        item, plaintext, thumbnail, original_dek = self.create_v2_vault()
+        self.assertEqual(cs.active_vault_format_version(), 2)
 
-        # Verify old password no longer works
-        lock_vault()
-        success_old, _ = load_vault("OriginalPassword123!")
-        test("Old password no longer works", not success_old)
+        migrated = cs.migrate_vault_to_v3(PASSWORD)
 
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        self.assertEqual(migrated, 1)
+        self.assertEqual(cs.active_vault_format_version(), 3)
+        self.assertEqual(cs.ACTIVE_DEK, original_dek)
+        self.assertEqual(cs.vault_metadata_state(self.temp_dir), "v3")
+        self.assertFalse(os.path.exists(cs.SALT_PATH))
+        self.assertFalse(os.path.exists(cs.DEK_PATH))
+        for payload_path in (
+            cs.INDEX_PATH,
+            cs.safe_vault_path(item["enc_id"]),
+            cs.safe_vault_path(item["enc_thumb_id"]),
+        ):
+            with open(payload_path, "rb") as payload_file:
+                self.assertEqual(payload_file.read(1), b"\x03")
 
-# ===========================================================================
-# PHASE 3 — Session & Auth
-# ===========================================================================
-def test_phase3():
-    heading("Phase 3 — Session & Auth Hardening")
+        with open(cs.safe_vault_path(item["enc_id"]), "rb") as media_file:
+            self.assertEqual(
+                cs.vault_decrypt(media_file.read(), cs.ACTIVE_DEK, context=f"media:{item['enc_id']}"),
+                plaintext,
+            )
+        with open(cs.safe_vault_path(item["enc_thumb_id"]), "rb") as thumb_file:
+            self.assertEqual(
+                cs.vault_decrypt(thumb_file.read(), cs.ACTIVE_DEK, context=f"thumb:{item['enc_thumb_id']}"),
+                thumbnail,
+            )
+        cs.lock_vault()
+        self.assertTrue(cs.load_vault(PASSWORD)[0])
 
-    try:
-        import crypthaven_server as cs
-        # Check that URL token auth is removed
-        source = open(os.path.join(os.path.dirname(__file__), "crypthaven_server.py"),
-                      "r", encoding="utf-8").read()
+    def test_v2_interruption_rolls_back_all_live_paths(self):
+        item, _, _, _ = self.create_v2_vault()
+        original_paths = (
+            cs.INDEX_PATH,
+            cs.SALT_PATH,
+            cs.DEK_PATH,
+            cs.safe_vault_path(item["enc_id"]),
+            cs.safe_vault_path(item["enc_thumb_id"]),
+        )
+        originals = {}
+        for path in original_paths:
+            with open(path, "rb") as source_file:
+                originals[path] = source_file.read()
 
-        test("URL token auth removed from check_auth",
-             "query.get('token'" not in source or "url_token" not in source,
-             "Found url_token or query.get('token') in check_auth — remove it")
+        with self.assertRaises(RuntimeError):
+            cs.migrate_vault_to_v3(PASSWORD, _fault_at="after_index_replace")
 
-        test("getTokenParam() removed from JavaScript",
-             "getTokenParam" not in source,
-             "getTokenParam still in JavaScript — remove it")
+        self.assertEqual(cs.vault_metadata_state(self.temp_dir), "v2")
+        self.assertFalse(os.path.exists(cs.KEY_ENVELOPE_PATH))
+        self.assertFalse(os.path.exists(cs.MIGRATION_JOURNAL_PATH))
+        for path, expected in originals.items():
+            with open(path, "rb") as source_file:
+                self.assertEqual(source_file.read(), expected)
+        cs.lock_vault()
+        self.assertTrue(cs.load_vault(PASSWORD)[0])
 
-        test("Token not in login JSON response",
-             "'token': new_session_token" not in source
-             and '"token": new_session_token' not in source
-             and "token': new_session_token" not in source,
-             "Token still returned in login response body")
+    def test_migration_refuses_unindexed_ciphertext_without_changing_vault(self):
+        item, _, _, _ = self.create_v2_vault()
+        orphan_path = cs.safe_vault_path("enc_orphan.enc")
+        orphan = secrets.token_bytes(96)
+        cs.atomic_write(orphan_path, orphan)
+        with open(cs.INDEX_PATH, "rb") as index_file:
+            original_index = index_file.read()
 
-        test("Cookie has Secure flag",
-             "Secure" in source and "auth_session=" in source,
-             "Cookie missing Secure flag")
+        with self.assertRaisesRegex(ValueError, "Unindexed ciphertext"):
+            cs.migrate_vault_to_v3(PASSWORD)
 
-        test("CSRF token generation exists",
-             "csrf" in source.lower() or "X-CSRF-Token" in source,
-             "No CSRF implementation found")
+        with open(cs.INDEX_PATH, "rb") as index_file:
+            self.assertEqual(index_file.read(), original_index)
+        with open(orphan_path, "rb") as orphan_file:
+            self.assertEqual(orphan_file.read(), orphan)
+        with open(cs.safe_vault_path(item["enc_id"]), "rb") as media_file:
+            self.assertEqual(media_file.read(1), b"\x02")
+        self.assertEqual(cs.vault_metadata_state(self.temp_dir), "v2")
 
-        test("Old password required for password change",
-             "old_password" in source,
-             "Password change doesn't require old password verification")
+    def test_mixed_v2_v3_payloads_remain_migration_eligible(self):
+        item, _, _, _ = self.create_v2_vault()
+        cs.save_index()
+        with open(cs.INDEX_PATH, "rb") as index_file:
+            self.assertEqual(index_file.read(1), b"\x03")
+        with open(cs.safe_vault_path(item["enc_id"]), "rb") as media_file:
+            self.assertEqual(media_file.read(1), b"\x02")
+        self.assertEqual(cs.active_vault_format_version(), 2)
+        self.assertEqual(cs.migrate_vault_to_v3(PASSWORD), 1)
+        self.assertEqual(cs.active_vault_format_version(), 3)
 
-        test("Server-side password minimum length check",
-             "len(new_pwd)" in source or "len(old_pwd)" in source,
-             "No server-side password length validation")
+    def test_v2_with_new_key_envelope_still_migrates_remaining_payloads(self):
+        item, _, _, original_dek = self.create_v2_vault()
+        cs.change_vault_password(PASSWORD, NEW_PASSWORD)
+        self.assertTrue(os.path.exists(cs.KEY_ENVELOPE_PATH))
+        self.assertFalse(os.path.exists(cs.SALT_PATH))
+        self.assertFalse(os.path.exists(cs.DEK_PATH))
+        with open(cs.safe_vault_path(item["enc_id"]), "rb") as media_file:
+            self.assertEqual(media_file.read(1), b"\x02")
+        self.assertEqual(cs.active_vault_format_version(), 2)
 
-    except Exception as e:
-        test("Phase 3 source analysis", False, str(e))
+        self.assertEqual(cs.migrate_vault_to_v3(NEW_PASSWORD), 1)
+        self.assertEqual(cs.ACTIVE_DEK, original_dek)
+        self.assertEqual(cs.active_vault_format_version(), 3)
+        cs.lock_vault()
+        self.assertTrue(cs.load_vault(NEW_PASSWORD)[0])
 
-# ===========================================================================
-# PHASE 4 — Transport Security
-# ===========================================================================
-def test_phase4():
-    heading("Phase 4 — Transport & Web Security")
 
-    try:
-        source = open(os.path.join(os.path.dirname(__file__), "crypthaven_server.py"),
-                      "r", encoding="utf-8").read()
+class InputAndSessionTests(TemporaryVaultTestCase):
+    def test_paths_names_and_encrypted_ids_reject_escape_or_markup(self):
+        export_root = os.path.join(self.temp_dir, "export")
+        os.makedirs(export_root)
+        with self.assertRaises(ValueError):
+            cs.safe_child_path(export_root, "..", "outside.txt")
+        with self.assertRaises(ValueError):
+            cs.validate_filename("..\\outside.txt")
+        with self.assertRaises(ValueError):
+            cs.normalize_subfolder("safe/../../outside")
+        with self.assertRaises(ValueError):
+            cs.validate_encrypted_id("x' onerror='alert(1)")
 
-        test("HSTS header present",
-             "Strict-Transport-Security" in source,
-             "No HSTS header found")
+    def test_request_size_limit_rejects_oversized_upload_before_read(self):
+        handler = object.__new__(cs.VaultGalleryHandler)
+        handler.headers = {
+            "Content-Length": str(cs.MAX_UPLOAD_BYTES + cs.MAX_REQUEST_METADATA_BYTES + 1)
+        }
+        responses = []
+        handler.send_json = lambda data, status=200: responses.append((status, data))
+        self.assertFalse(handler.validate_request_size('/api/upload'))
+        self.assertEqual(responses[0][0], 413)
 
-        test("TLS minimum version configured",
-             "TLSv1_2" in source or "minimum_version" in source,
-             "No explicit TLS minimum version")
+    def test_expired_session_is_rejected_and_csrf_covers_header_auth(self):
+        self.initialize()
+        token = "a" * 32
+        csrf = "b" * 64
+        cs.ACTIVE_SESSIONS[token] = {
+            "csrf": csrf,
+            "created": time.time() - cs.SESSION_ABSOLUTE_TIMEOUT_SECONDS - 1,
+            "last_seen": time.time(),
+        }
+        handler = object.__new__(cs.VaultGalleryHandler)
+        handler.headers = {"X-Auth-Token": token, "X-CSRF-Token": csrf}
+        handler.client_address = ("127.0.0.1", 12345)
+        self.assertFalse(handler.check_auth())
+        self.assertNotIn(token, cs.ACTIVE_SESSIONS)
 
-        test("HTTP to HTTPS redirect exists",
-             ("301" in source or "307" in source) and ("https://" in source or "redirect" in source.lower()),
-             "No HTTP→HTTPS redirect found")
+        fresh_token = "c" * 32
+        cs.ACTIVE_SESSIONS[fresh_token] = {
+            "csrf": csrf, "created": time.time(), "last_seen": time.time()
+        }
+        handler.headers = {"X-Auth-Token": fresh_token}
+        self.assertTrue(handler.check_auth())
+        self.assertFalse(handler.validate_csrf())
+        handler.headers["X-CSRF-Token"] = csrf
+        self.assertTrue(handler.validate_csrf())
 
-        test("Path traversal guard exists",
-             "startswith" in source and "abspath" in source,
-             "No path canonicalization check found")
 
-    except Exception as e:
-        test("Phase 4 source analysis", False, str(e))
+class HTTPIntegrationTests(TemporaryVaultTestCase):
+    def setUp(self):
+        super().setUp()
+        self.assertTrue(cs.generate_self_signed_ssl_certificate())
+        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        tls_context.load_cert_chain(cs.CERT_PATH, cs.KEY_PATH)
+        self.server = cs.ThreadedHTTPServer(('127.0.0.1', 0), cs.VaultGalleryHandler)
+        self.server.socket = tls_context.wrap_socket(self.server.socket, server_side=True)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.client_context = ssl.create_default_context()
+        self.client_context.check_hostname = False
+        self.client_context.verify_mode = ssl.CERT_NONE
 
-# ===========================================================================
-# Run all tests
-# ===========================================================================
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        super().tearDown()
+
+    def request(self, method, path, body=None, headers=None):
+        connection = http.client.HTTPSConnection(
+            '127.0.0.1', self.port, context=self.client_context, timeout=10
+        )
+        connection.request(method, path, body=body, headers=headers or {})
+        response = connection.getresponse()
+        payload = response.read()
+        result = response.status, response.getheaders(), payload
+        connection.close()
+        return result
+
+    def test_login_csrf_authenticated_api_logout_and_size_limit(self):
+        login_body = urllib.parse.urlencode({'password': PASSWORD})
+        status, headers, _ = self.request(
+            'POST', '/login', login_body,
+            {'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json'}
+        )
+        self.assertEqual(status, 200)
+        cookie_values = [value for name, value in headers if name.lower() == 'set-cookie']
+        auth_cookie = next(value.split(';', 1)[0] for value in cookie_values if value.startswith('auth_session='))
+        csrf_cookie = next(value.split(';', 1)[0] for value in cookie_values if value.startswith('csrf_token='))
+        csrf_token = csrf_cookie.split('=', 1)[1]
+        cookie_header = f'{auth_cookie}; {csrf_cookie}'
+
+        status, _, _ = self.request('GET', '/api/folders', headers={'Cookie': cookie_header})
+        self.assertEqual(status, 200)
+
+        status, _, _ = self.request(
+            'POST', '/api/admin/cloud_backup', headers={'Cookie': cookie_header}
+        )
+        self.assertEqual(status, 403)
+
+        status, _, _ = self.request(
+            'POST', '/logout',
+            headers={'Cookie': cookie_header, 'X-CSRF-Token': csrf_token}
+        )
+        self.assertEqual(status, 200)
+        status, _, _ = self.request('GET', '/api/folders', headers={'Cookie': cookie_header})
+        self.assertEqual(status, 401)
+
+        status, _, _ = self.request(
+            'POST', '/login', b'',
+            {'Content-Length': str(cs.MAX_LOGIN_BODY_BYTES + 1), 'Accept': 'application/json'}
+        )
+        self.assertEqual(status, 413)
+
+    def test_http_redirect_does_not_reflect_untrusted_host(self):
+        redirect_server = cs.ThreadedHTTPServer(('127.0.0.1', 0), cs.HTTPRedirectHandler)
+        redirect_port = redirect_server.server_address[1]
+        redirect_thread = threading.Thread(target=redirect_server.serve_forever, daemon=True)
+        redirect_thread.start()
+        try:
+            connection = http.client.HTTPConnection('127.0.0.1', redirect_port, timeout=10)
+            connection.request('GET', '/login', headers={'Host': 'attacker.example'})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 307)
+            self.assertNotIn('attacker.example', response.getheader('Location'))
+            response.read()
+            connection.close()
+        finally:
+            redirect_server.shutdown()
+            redirect_server.server_close()
+            redirect_thread.join(timeout=5)
+
+
 if __name__ == "__main__":
-    print("\n🛡️  CryptHaven Security Upgrade — Test Suite\n")
-
-    test_phase0()
-    test_phase1()
-    test_phase1b()
-    test_phase2()
-    test_phase2b()
-    test_phase3()
-    test_phase4()
-
-    print(f"\n{'='*60}")
-    print(f"  Results: {PASS_COUNT} passed, {FAIL_COUNT} failed")
-    print(f"{'='*60}")
-
-    if FAIL_COUNT > 0:
-        print("\n⚠️  SOME TESTS FAILED — Fix failures before proceeding.\n")
-        sys.exit(1)
-    else:
-        print("\n✅ ALL TESTS PASSED\n")
-        sys.exit(0)
+    unittest.main(verbosity=2)
