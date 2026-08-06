@@ -18,7 +18,6 @@ CryptHaven is a self-hosted media vault server that keeps your personal photos a
 - **🔒 Encrypted at Rest**: All media is encrypted using AES-256-GCM with Argon2id key derivation and a DEK/KEK key architecture.
 - **📱 Responsive Local Web Gallery**: Full-screen media viewer with pinch-to-zoom, touch navigation, auto-fading controls, and side-tap zone navigation.
 - **🛡️ Configurable DRM & Download Controls**: Toggle media downloading and saving permissions per vault session directly from the launcher.
-- **🛑 Single-Instance Safeguard**: Windows Mutex enforcement prevents duplicate server instances with a system-modal warning dialog.
 - **🔄 System Tray Integration & Vault Switching**: Switch vaults on the fly or manage server actions from the Windows system tray.
 - **📁 Folder Management & Bulk Actions**: Organize media into subfolders with multi-select bulk move, delete, and export.
 - **🔍 Search & Duplicate Cleaner**: Search files by name and identify duplicate files to reclaim storage space.
