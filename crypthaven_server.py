@@ -45,7 +45,7 @@ if sys.stdout is not None and hasattr(sys.stdout, 'reconfigure'):
 # ---------------------------------------------------------------------------
 
 # ── Configuration ──────────────────────────────────────────────────────────
-VERSION = "v0.3.1-alpha"
+VERSION = "v0.3.2-alpha"
 PORT = int(os.environ.get('CRYPTHAVEN_PORT', 8080))
 HTTPS_PORT = int(os.environ.get('CRYPTHAVEN_HTTPS_PORT', 8443))
 ALLOW_DOWNLOADS = os.environ.get('CRYPTHAVEN_ALLOW_DOWNLOADS', 'false').lower() == 'true'
