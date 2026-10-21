@@ -1,6 +1,6 @@
 cryptography==50.0.2
 Pillow==13.0.0
-pillow-heif==1.5.0
+pillow-heif==1.8.1
 pystray==0.19.5
 argon2-cffi==25.1.0
 cffi==2.1.1
