@@ -1,6 +1,6 @@
 # 🛡️ CryptHaven
 
-[![Version](https://img.shields.io/badge/version-v0.3.1--alpha-blue.svg)](https://github.com/BrannonSD/CryptHaven/releases)
+[![Version](https://img.shields.io/badge/version-v0.3.2--alpha-blue.svg)](https://github.com/BrannonSD/CryptHaven/releases)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Encryption: AES-256-GCM](https://img.shields.io/badge/Encryption-AES--256--GCM-green.svg)](#security-architecture)
@@ -46,7 +46,7 @@ CryptHaven is designed to protect vault contents at rest while the vault is lock
 ## 🚀 Quick Start
 
 ### Executable Download (Windows)
-Download pre-built standalone binaries from the **[Releases](https://github.com/BrannonSD/CryptHaven/releases)** section (`CryptHaven-v0.3.1-alpha.exe`).
+Download pre-built standalone binaries from the **[Releases](https://github.com/BrannonSD/CryptHaven/releases)** section (`CryptHaven-v0.3.2-alpha.exe`).
 
 ### Running from Source
 

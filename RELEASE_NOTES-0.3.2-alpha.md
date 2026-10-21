@@ -1,0 +1,1 @@
+CryptHaven 0.3.2-alpha refreshes Pillow to 13.0.0 and cryptography to 50.0.2, addressing the October image decoder advisories and current cryptographic dependency fixes. Existing vault formats and keys are preserved. The standalone Windows binary is rebuilt from these pinned dependencies.
