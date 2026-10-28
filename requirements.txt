@@ -4,6 +4,6 @@ pillow-heif==1.5.0
 pystray==0.19.5
 argon2-cffi==25.1.0
 cffi==2.1.1
-pycparser==3.0
+pycparser==3.12
 six==1.17.0
 argon2-cffi-bindings==25.1.0
